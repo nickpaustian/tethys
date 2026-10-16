@@ -75,6 +75,17 @@ ticket.started            // true once the run has begun
 | `bytesPerSecond` | received bytes over the last `bandwidthWindowMs` |
 | `clients[]` | per client: `name`, `weight`, `queued`, `inFlight`, `started`, `bytes` |
 
+## Development
+
+```
+npm ci
+npm test            # vitest: ordering, re-prioritising and cancelling, slot accounting, the bandwidth window
+npm run typecheck
+npm run build       # dist/
+```
+
+CI runs typecheck, tests and build on every push and pull request, and publishes to npm with provenance on a `v*` tag.
+
 ## Licence
 
 MIT.
