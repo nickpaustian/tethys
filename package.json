@@ -1,0 +1,49 @@
+{
+  "name": "@nickpaustian/tethys",
+  "version": "0.1.0",
+  "description": "A shared fetch pool for streaming modules: one connection budget, cross-module priorities and a bandwidth estimate",
+  "type": "module",
+  "license": "MIT",
+  "author": "Nicholas Paustian",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nickpaustian/tethys.git"
+  },
+  "homepage": "https://github.com/nickpaustian/tethys#readme",
+  "bugs": "https://github.com/nickpaustian/tethys/issues",
+  "keywords": [
+    "fetch",
+    "pool",
+    "priority",
+    "bandwidth",
+    "streaming",
+    "scheduler"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.2"
+  }
+}
