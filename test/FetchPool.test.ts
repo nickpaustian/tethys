@@ -123,6 +123,31 @@ describe("FetchPool", () => {
     expect(started).toEqual(["running"])
   })
 
+  it("starts a client under its reserve ahead of higher-ranked requests from the others", async () => {
+    const pool = new FetchPool({ concurrency: 2 })
+    const geometry = pool.client("geometry", { weight: 1 })
+    const texture = pool.client("texture", { weight: 0.5, reserve: 1 })
+    const { started, run, release } = makeRuns()
+    geometry.submit(1, run("g1"))
+    geometry.submit(1, run("g2"))
+    geometry.submit(1, run("g3"))
+    texture.submit(0.1, run("t1"))
+    texture.submit(0.1, run("t2"))
+    await tick()
+    expect(started).toEqual(["g1", "g2"])
+    release("g1")
+    await tick()
+    expect(started).toEqual(["g1", "g2", "t1"])
+    release("g2")
+    await tick()
+    // The texture has its one reserved connection; the geometry's higher rank wins the next slot
+    expect(started).toEqual(["g1", "g2", "t1", "g3"])
+    release("t1")
+    await tick()
+    expect(started).toEqual(["g1", "g2", "t1", "g3", "t2"])
+    expect(pool.stats.clients.find((c) => c.name === "texture")!.reserve).toBe(1)
+  })
+
   it("reuses a client by name and updates its weight", () => {
     const pool = new FetchPool()
     const first = pool.client("a", { weight: 0.5 })

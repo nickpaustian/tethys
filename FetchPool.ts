@@ -9,6 +9,10 @@ export interface PoolClientOptions {
   // Relative share of the pool: a request is ordered by weight x its own priority, so a client
   // whose work matters more when both are starved gets a higher weight
   weight?: number
+  // Connections the client is owed before weight and priority decide: while it has fewer than
+  // this in flight, its waiting request starts ahead of every other client's, so a module with
+  // small frequent fetches (tiles) is not starved by one with large valuable ones (pages)
+  reserve?: number
 }
 
 export interface PoolTicket {
@@ -29,6 +33,7 @@ export type PoolRun = (context: PoolRunContext) => Promise<void>
 export interface PoolClientStats {
   name: string
   weight: number
+  reserve: number
   queued: number
   inFlight: number
   started: number
@@ -74,13 +79,14 @@ export default class FetchPool {
     this.bandwidthWindowMs = bandwidthWindowMs
   }
 
-  public client(name: string, { weight = 1 }: PoolClientOptions = {}): PoolClient {
+  public client(name: string, { weight = 1, reserve = 0 }: PoolClientOptions = {}): PoolClient {
     let client = this.clients.get(name)
     if (!client) {
-      client = new PoolClient(this, name, weight)
+      client = new PoolClient(this, name, weight, reserve)
       this.clients.set(name, client)
     } else {
       client.weight = weight
+      client.reserve = reserve
     }
     return client
   }
@@ -110,11 +116,23 @@ export default class FetchPool {
   private pump(): void {
     if (this.disposed) return
     while (this.inFlight < this.concurrency && this.waiting.length > 0) {
-      let best = 0
-      for (let i = 1; i < this.waiting.length; i++) {
-        const a = this.waiting[i], b = this.waiting[best]
-        const ea = a.client.weight * a.priority, eb = b.client.weight * b.priority
-        if (ea > eb || (ea === eb && a.order < b.order)) best = i
+      // A client under its reserve is owed the slot; among the owed, or among the rest, the
+      // highest weight x priority wins, oldest first on ties
+      let best = -1
+      let bestOwed = false
+      for (let i = 0; i < this.waiting.length; i++) {
+        const a = this.waiting[i]
+        const owed = a.client.inFlight < a.client.reserve
+        if (best !== -1) {
+          if (bestOwed && !owed) continue
+          if (owed === bestOwed) {
+            const b = this.waiting[best]
+            const ea = a.client.weight * a.priority, eb = b.client.weight * b.priority
+            if (!(ea > eb || (ea === eb && a.order < b.order))) continue
+          }
+        }
+        best = i
+        bestOwed = owed
       }
       const [entry] = this.waiting.splice(best, 1)
       entry.started = true
@@ -173,6 +191,7 @@ export default class FetchPool {
 // module (0..1) and keeps its own counts
 export class PoolClient {
   public weight: number
+  public reserve: number
   public readonly name: string
   private pool: FetchPool
   private queued: number = 0
@@ -180,10 +199,15 @@ export class PoolClient {
   private started: number = 0
   private bytes: number = 0
 
-  constructor(pool: FetchPool, name: string, weight: number) {
+  constructor(pool: FetchPool, name: string, weight: number, reserve: number = 0) {
     this.pool = pool
     this.name = name
     this.weight = weight
+    this.reserve = reserve
+  }
+
+  public get inFlight(): number {
+    return this.running
   }
 
   public submit(priority: number, run: PoolRun, onCancel?: () => void): PoolTicket {
@@ -222,6 +246,6 @@ export class PoolClient {
   }
 
   public get stats(): PoolClientStats {
-    return { name: this.name, weight: this.weight, queued: this.queued, inFlight: this.running, started: this.started, bytes: this.bytes }
+    return { name: this.name, weight: this.weight, reserve: this.reserve, queued: this.queued, inFlight: this.running, started: this.started, bytes: this.bytes }
   }
 }

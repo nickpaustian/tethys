@@ -28,7 +28,7 @@ const vt = new VirtualTexture({ channels, pool: pool.client("atlas", { weight: 0
 pool.stats.bytesPerSecond // over the last two seconds, for a detail cap policy
 ```
 
-A client submits each fetch with a priority normalised within the module (its most wanted item is 1). The pool starts the waiting request with the highest `weight × priority` whenever a slot is free, oldest first on ties. Giving geometry the higher weight is a reasonable default, because a missing page reads as a hole where a missing tile reads as a soft texture. A waiting request can be withdrawn or re-prioritised; a running one is left to its module's own abort handling, which frees the slot when the fetch settles.
+A client submits each fetch with a priority normalised within the module (its most wanted item is 1). The pool starts the waiting request with the highest `weight × priority` whenever a slot is free, oldest first on ties, after any client that is still under its `reserve`. Giving geometry the higher weight is a reasonable default, because a missing page reads as a hole where a missing tile reads as a soft texture. A waiting request can be withdrawn or re-prioritised; a running one is left to its module's own abort handling, which frees the slot when the fetch settles.
 
 Theia submits a ticket per page and gathers its coalesced range request only when the pool starts one, so neighbours that arrived in the queue since are still pulled in. Atlas submits a ticket per tile.
 
@@ -46,6 +46,7 @@ Theia submits a ticket per page and gathers its coalesced range request only whe
 | option | default | meaning |
 | --- | --- | --- |
 | `weight` | 1 | relative share of the pool; a request is ordered by weight × its own priority |
+| `reserve` | 0 | connections the client is owed before weight and priority decide: while it has fewer than this in flight, its waiting request starts ahead of every other client's. A module with small frequent fetches (tiles, a few kilobytes each) is otherwise starved by one whose fetches rank higher for seconds at a time (geometry pages after a zoom); a reserve of a quarter of the pool for each keeps both moving |
 
 ## Writing a client
 
@@ -62,7 +63,7 @@ ticket.cancel()           // withdraw a waiting request
 ticket.started            // true once the run has begun
 ```
 
-`submit(priority, run, onCancel?)` queues a run and returns a ticket. `run` receives a context whose `progress(bytes)` feeds the bandwidth estimate; the slot is freed when the run's promise settles, however it settles. The pool never aborts a running fetch; that stays with the client. `client.weight` can be changed at any time.
+`submit(priority, run, onCancel?)` queues a run and returns a ticket. `client.inFlight` is how many of its runs are going. `run` receives a context whose `progress(bytes)` feeds the bandwidth estimate; the slot is freed when the run's promise settles, however it settles. The pool never aborts a running fetch; that stays with the client. `client.weight` can be changed at any time.
 
 ## Stats
 
@@ -73,7 +74,7 @@ ticket.started            // true once the run has begun
 | `concurrency` | the pool's budget |
 | `inFlight`, `queued` | requests running and waiting across all clients |
 | `bytesPerSecond` | received bytes over the last `bandwidthWindowMs` |
-| `clients[]` | per client: `name`, `weight`, `queued`, `inFlight`, `started`, `bytes` |
+| `clients[]` | per client: `name`, `weight`, `reserve`, `queued`, `inFlight`, `started`, `bytes` |
 
 ## Development
 
