@@ -1,6 +1,6 @@
 {
   "name": "@nickpaustian/tethys",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A shared fetch pool for streaming modules: one connection budget, cross-module priorities and a bandwidth estimate",
   "type": "module",
   "license": "MIT",
