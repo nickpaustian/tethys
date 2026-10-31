@@ -12,8 +12,8 @@ const makeOwner = (pinnedItems: string[] = []) => {
       held.delete(slot)
     },
   }
-  const place = (pool: ResidencyPool, item: string, now: number) => {
-    const slot = pool.allocate(owner, now)
+  const place = (pool: ResidencyPool, item: string, now: number, priority?: number) => {
+    const slot = pool.allocate(owner, now, priority)
     if (slot >= 0) held.set(slot, item)
     return slot
   }
@@ -61,6 +61,43 @@ describe("ResidencyPool", () => {
     expect(forA.map((w) => w.id)).toEqual(["a-mid"])
     const forB = pool.offer(b.owner, [{ priority: 9, id: "b-high" }, { priority: 1, id: "b-low" }], 0, 2)
     expect(forB.map((w) => w.id)).toEqual(["b-high"])
+  })
+
+  it("lets another owner's want take a protected slot it is worth more than, least valued first, never the owner's own or a pinned one", () => {
+    const pool = new ResidencyPool({ slots: 3, protectMs: 1000, budget: false })
+    const a = makeOwner(["root"])
+    const b = makeOwner()
+    a.place(pool, "root", 0, 100)
+    a.place(pool, "low", 0, 2)
+    a.place(pool, "mid", 0, 4)
+    // All protected: a's own want cannot take its own slots, b's must beat a value by 1.5x
+    expect(a.place(pool, "a-more", 10, 50)).toBe(-1)
+    expect(pool.offer(b.owner, [{ priority: 2.5 }], 0, 10)).toEqual([])
+    // 7 beats "low" (2); 3.5 would need more than 1.5 x "mid" (4); "root" is pinned
+    expect(pool.offer(b.owner, [{ priority: 7 }, { priority: 3.5 }, { priority: 1 }], 0, 10)).toEqual([{ priority: 7 }])
+    expect(b.place(pool, "b1", 20, 7)).toBeGreaterThanOrEqual(0)
+    expect(a.evicted).toEqual(["low"])
+    // b's new slot carries its want's value, so a cannot take it back for less
+    pool.touch([...a.held].find(([, item]) => item === "mid")![0], 30, 4)
+    expect(a.place(pool, "a-back", 40, 9)).toBe(-1)
+    expect(a.place(pool, "a-back", 40, 11)).toBeGreaterThanOrEqual(0)
+    expect(b.evicted).toEqual(["b1"])
+  })
+
+  it("does not raise the scale while wants can be met by contesting", () => {
+    const pool = new ResidencyPool({ slots: 2, protectMs: 10_000, budgetIntervalMs: 100 })
+    const a = makeOwner()
+    const b = makeOwner()
+    a.place(pool, "a1", 0, 1)
+    a.place(pool, "a2", 0, 1)
+    pool.offer(b.owner, [{ priority: 5 }], 0, 100)
+    expect(b.place(pool, "b1", 150, 5)).toBeGreaterThanOrEqual(0)
+    pool.offer(b.owner, [{ priority: 5 }], 0, 200)
+    pool.offer(b.owner, [{ priority: 5 }], 0, 300)
+    expect(pool.scale).toBe(1)
+    // Worth too little to contest a2: stuck, so the scale rises
+    pool.offer(b.owner, [{ priority: 1.2 }], 0, 400)
+    expect(pool.scale).toBeCloseTo(1.25)
   })
 
   it("lets an offer age out, so an owner that stops asking holds no share", () => {
