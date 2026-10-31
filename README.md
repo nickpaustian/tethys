@@ -88,6 +88,7 @@ const pool = new ResidencyPool({ slots: 4096 })
 const owner: ResidencyOwner = {
   pinned: (slot) => slot === myRootSlot,        // never taken (a root page)
   evict: (slot) => forget(slot),                // the pool gave this slot to someone else
+  yield: (slot) => fadeOut(slot),               // optional: claimed, goes in yieldMs
 }
 
 // Each frame: post what is wanted, with priorities every owner shares (projected error in
@@ -106,6 +107,7 @@ pool.release(owner)                                    // the owner goes: its sl
 
 - **Eviction.** Slots go free first, then least recently used across owners. The owner of a slot taken is told through `evict` before `allocate` returns. A slot `pinned` by its owner is never taken.
 - **Contesting.** A slot touched within `protectMs` is safe from LRU and from its own owner's wants, but not from another owner whose want is worth more than `contestMargin` times the slot's value (the least valued goes first). So an owner arriving to a full pool gets what others hold for less than it is worth to it, and the split between owners follows what each one's detail is worth rather than who came first. The margin keeps two owners with like needs from trading slots back and forth. Values come from `touch(slot, now, value)`, in the measure wants are ranked by; a slot never given one is never contested (`allocate` gives it the priority it was claimed with).
+- **Yielding.** Taking a slot that is in use shows: whatever it held vanishes from one frame to the next. An owner with a `yield` hook is told instead that its slot is claimed, and keeps it for `yieldMs` to fade out what it holds; the slot is then the first one `allocate` takes, and a claimant whose data arrives sooner gets -1 and should hold it and try again. A yielding slot is not claimed twice. An owner without the hook loses a contested slot as soon as the claimant allocates.
 - **Ranking, once a frame.** Each owner posts what it wants with priorities and how many it has in flight. `settle(now)` ranks every post since the last settle in one pass: the highest wants take the free capacity left after every owner's in-flight count, those further down whatever slots they can contest, and the scale is judged once. `post` returns the owner's grants from the last settle, so wants are acted on a frame after they are posted; act on those still wanted. The pool settles by itself when an owner posts a second time, since a new frame has begun, so a host need not call `settle`; calling it after every owner's update decides within the frame instead. An owner that posted nothing counts as wanting nothing, so one that stops updating (frozen, off screen) holds no share of what is handed out. The decision is the same whatever order owners update in, and costs one ranking a frame however many owners there are.
 - **Scale.** Once nothing is free and nothing is worth contesting, nothing moves. `scale` then rises (× `raiseBy`) while more is wanted than fits and nothing was placed in the last `budgetIntervalMs`, and falls back toward 1 (÷ `easeBy`) once wants are met and `budgetHeadroom` of the slots is free. Owners apply it to their own detail measure, so every owner coarsens evenly.
 
@@ -116,6 +118,7 @@ pool.release(owner)                                    // the owner goes: its sl
 | `slots` | required | things resident at once across every owner |
 | `protectMs` | 500 | milliseconds a used slot is safe from being taken |
 | `contestMargin` | 1.5 | how many times a protected slot's value another owner's want must exceed to take it |
+| `yieldMs` | 250 | milliseconds an owner with a `yield` hook keeps a contested slot before it goes |
 | `budget` | true | whether `scale` follows what fits; off, it stays where it is |
 | `budgetIntervalMs` | 600 | milliseconds between scale decisions; keep it longer than `protectMs` |
 | `budgetHeadroom` | 0.1 | free share of the slots below which the scale is not lowered |
@@ -128,7 +131,7 @@ pool.release(owner)                                    // the owner goes: its sl
 
 ```
 npm ci
-npm test            # vitest: ordering, re-prioritising and cancelling, slot accounting, the bandwidth window; residency eviction, protection and pins, contesting by value, ranking across owners at a settle, settling by itself a frame late, the scale
+npm test            # vitest: ordering, re-prioritising and cancelling, slot accounting, the bandwidth window; residency eviction, protection and pins, contesting by value, yielding, ranking across owners at a settle, settling by itself a frame late, the scale
 npm run typecheck
 npm run build       # dist/
 ```

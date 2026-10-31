@@ -3,6 +3,9 @@ export interface ResidencyOwner {
   pinned(slot: number): boolean
   // The pool gave this slot to something else; forget what it held
   evict(slot: number): void
+  // Optional: another owner has claimed this slot, which goes in yieldMs; stop using what it
+  // holds now (fade it out) so its going is not seen. Owners without it are evicted at once
+  yield?(slot: number): void
 }
 
 export interface ResidencyWant {
@@ -19,6 +22,8 @@ export interface ResidencyPoolOptions {
   // How many times a slot's value another owner's want must exceed to take it while it is
   // protected; above 1 so two owners with like needs do not trade the same slots back and forth
   contestMargin?: number
+  // Milliseconds a contested slot whose owner can yield stays with it, to fade out what it holds
+  yieldMs?: number
   // Whether the budget adjusts `scale`; off, it stays where it is
   budget?: boolean
   // Milliseconds between budget decisions; longer than protectMs, since a change shows only
@@ -58,7 +63,9 @@ export interface ResidencyPoolStats {
 // than `contestMargin` times a protected slot's value may take it. So an owner that arrives to
 // a full pool gets the slots another holds for less than they are worth to it, and the split
 // between owners follows what each one's detail is worth rather than who came first. A slot
-// given no value is never contested.
+// given no value is never contested. An owner that can `yield` is told its slot is claimed and
+// keeps it for `yieldMs`, so it can fade out what the slot holds rather than lose it from one
+// frame to the next; the slot is then the first taken.
 //
 // Requests are ranked across owners once a frame. Each owner posts what it wants with
 // priorities and how many it already has in flight; `settle` ranks every post since the last
@@ -79,6 +86,7 @@ export default class ResidencyPool {
   public readonly slots: number
   public protectMs: number
   public contestMargin: number
+  public yieldMs: number
   public budget: boolean
   public budgetIntervalMs: number
   public budgetHeadroom: number
@@ -90,6 +98,8 @@ export default class ResidencyPool {
   private readonly owners: (ResidencyOwner | null)[]
   private readonly lastUsed: Float64Array
   private readonly values: Float64Array
+  // When each slot was claimed from an owner that yields; -1 when it was not
+  private readonly yieldingAt: Float64Array
   // The free slots as a stack, so taking or freeing one is O(1)
   private readonly freeSlots: Int32Array
   private freeSlotCount: number
@@ -106,6 +116,7 @@ export default class ResidencyPool {
     slots,
     protectMs = 500,
     contestMargin = 1.5,
+    yieldMs = 250,
     budget = true,
     budgetIntervalMs = 600,
     budgetHeadroom = 0.1,
@@ -117,6 +128,7 @@ export default class ResidencyPool {
     this.slots = Math.floor(slots)
     this.protectMs = protectMs
     this.contestMargin = contestMargin
+    this.yieldMs = yieldMs
     this.budget = budget
     this.budgetIntervalMs = budgetIntervalMs
     this.budgetHeadroom = budgetHeadroom
@@ -126,6 +138,7 @@ export default class ResidencyPool {
     this.owners = new Array(this.slots).fill(null)
     this.lastUsed = new Float64Array(this.slots)
     this.values = new Float64Array(this.slots).fill(Infinity)
+    this.yieldingAt = new Float64Array(this.slots).fill(-1)
     this.freeSlots = new Int32Array(this.slots)
     for (let i = 0; i < this.slots; i++) this.freeSlots[i] = this.slots - 1 - i
     this.freeSlotCount = this.slots
@@ -150,22 +163,27 @@ export default class ResidencyPool {
     return this.freeSlotCount
   }
 
-  private evictable(slot: number, minUsed: number): boolean {
-    const owner = this.owners[slot]
-    return owner !== null && this.lastUsed[slot] < minUsed && !owner.pinned(slot)
+  private yielded(slot: number, now: number): boolean {
+    return this.yieldingAt[slot] >= 0 && now - this.yieldingAt[slot] >= this.yieldMs
   }
 
-  // Slots something new could take now: free ones and those neither protected nor pinned
+  private evictable(slot: number, now: number): boolean {
+    const owner = this.owners[slot]
+    return owner !== null && (this.lastUsed[slot] < now - this.protectMs || this.yielded(slot, now)) && !owner.pinned(slot)
+  }
+
+  // Slots something new could take now: free ones, those neither protected nor pinned, and
+  // those whose owner has had its time to yield
   public availableSlots(now: number): number {
-    const minUsed = now - this.protectMs
     let count = this.freeSlotCount
-    for (let slot = 0; slot < this.slots; slot++) if (this.evictable(slot, minUsed)) count++
+    for (let slot = 0; slot < this.slots; slot++) if (this.evictable(slot, now)) count++
     return count
   }
 
-  // A slot for `owner`'s want of this priority: a free one, else the least recently used that
-  // may be taken, else the least valued protected slot of another owner that the priority
-  // contests; its owner is told before this returns. -1 when none can be had. The priority is
+  // A slot for `owner`'s want of this priority: a free one, else one whose owner has yielded
+  // it, else the least recently used that may be taken, else the least valued protected slot of
+  // another owner that cannot yield that the priority contests; its owner is told before this
+  // returns. -1 when none can be had, as when a claimed slot is still yielding. The priority is
   // the slot's value until its owner touches it with another
   public allocate(owner: ResidencyOwner, now: number, priority: number = Infinity): number {
     this.members.add(owner)
@@ -173,13 +191,13 @@ export default class ResidencyPool {
     if (this.freeSlotCount > 0) {
       slot = this.freeSlots[--this.freeSlotCount]
     } else {
-      const minUsed = now - this.protectMs
       slot = -1
       let oldest = Infinity
       for (let s = 0; s < this.slots; s++) {
-        if (!this.evictable(s, minUsed)) continue
-        if (this.lastUsed[s] < oldest) {
-          oldest = this.lastUsed[s]
+        if (!this.evictable(s, now)) continue
+        const used = this.yielded(s, now) ? -Infinity : this.lastUsed[s]
+        if (used < oldest) {
+          oldest = used
           slot = s
         }
       }
@@ -190,18 +208,20 @@ export default class ResidencyPool {
     this.owners[slot] = owner
     this.lastUsed[slot] = now
     this.values[slot] = priority
+    this.yieldingAt[slot] = -1
     this.allocations++
     return slot
   }
 
-  // A protected slot of another owner whose value `priority` beats by the margin, least valued first
+  // A protected slot of another owner that cannot yield, whose value `priority` beats by the
+  // margin, least valued first
   private cheapestContestable(owner: ResidencyOwner, priority: number, now: number): number {
     const minUsed = now - this.protectMs
     let best = -1
     let lowest = priority / this.contestMargin
     for (let s = 0; s < this.slots; s++) {
       const holder = this.owners[s]
-      if (holder === null || holder === owner || this.lastUsed[s] < minUsed || this.values[s] >= lowest || holder.pinned(s)) continue
+      if (holder === null || holder === owner || holder.yield || this.lastUsed[s] < minUsed || this.values[s] >= lowest || holder.pinned(s)) continue
       lowest = this.values[s]
       best = s
     }
@@ -212,6 +232,7 @@ export default class ResidencyPool {
   public free(slot: number): void {
     if (!this.owners[slot]) return
     this.owners[slot] = null
+    this.yieldingAt[slot] = -1
     this.freeSlots[this.freeSlotCount++] = slot
   }
 
@@ -242,7 +263,7 @@ export default class ResidencyPool {
     }
     ranked.sort((a, b) => b.want.priority - a.want.priority)
     let placeable = 0
-    let contestable: Array<{ owner: ResidencyOwner; value: number; taken: boolean }> | null = null
+    let contestable: Array<{ slot: number; owner: ResidencyOwner; value: number; taken: boolean }> | null = null
     let cheapest = 0
     for (const { owner, want } of ranked) {
       if (free > 0) {
@@ -260,7 +281,14 @@ export default class ResidencyPool {
           }
         }
         if (at === -1) continue
-        contestable[at].taken = true
+        const claim = contestable[at]
+        claim.taken = true
+        // An owner that can yield keeps the slot a while to fade out what it holds; one that
+        // cannot loses it when the claimant's page arrives
+        if (claim.owner.yield) {
+          this.yieldingAt[claim.slot] = now
+          claim.owner.yield(claim.slot)
+        }
       }
       placeable++
       let list = this.grants.get(owner)
@@ -271,13 +299,13 @@ export default class ResidencyPool {
   }
 
   // Protected slots that hold a value, least valued first
-  private contestable(now: number): Array<{ owner: ResidencyOwner; value: number; taken: boolean }> {
+  private contestable(now: number): Array<{ slot: number; owner: ResidencyOwner; value: number; taken: boolean }> {
     const minUsed = now - this.protectMs
-    const slots: Array<{ owner: ResidencyOwner; value: number; taken: boolean }> = []
+    const slots: Array<{ slot: number; owner: ResidencyOwner; value: number; taken: boolean }> = []
     for (let s = 0; s < this.slots; s++) {
       const holder = this.owners[s]
-      if (holder === null || this.lastUsed[s] < minUsed || this.values[s] === Infinity || holder.pinned(s)) continue
-      slots.push({ owner: holder, value: this.values[s], taken: false })
+      if (holder === null || this.lastUsed[s] < minUsed || this.yieldingAt[s] >= 0 || this.values[s] === Infinity || holder.pinned(s)) continue
+      slots.push({ slot: s, owner: holder, value: this.values[s], taken: false })
     }
     return slots.sort((a, b) => a.value - b.value)
   }

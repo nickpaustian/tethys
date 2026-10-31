@@ -104,6 +104,32 @@ describe("ResidencyPool", () => {
     expect(b.evicted).toEqual(["b1"])
   })
 
+  it("tells an owner that can yield its slot is claimed, lets it keep the slot for yieldMs, then gives that slot first", () => {
+    const pool = new ResidencyPool({ slots: 2, protectMs: 10_000, yieldMs: 100, budget: false })
+    const a = makeOwner()
+    const yielded: number[] = []
+    a.owner.yield = (slot) => yielded.push(slot)
+    const b = makeOwner()
+    a.place(pool, "a-low", 0, 1)
+    a.place(pool, "a-high", 0, 50)
+    const low = [...a.held].find(([, item]) => item === "a-low")![0]
+    pool.post(b.owner, [{ priority: 9 }, { priority: 8 }], 0, 10)
+    pool.settle(10)
+    // Claimed, not taken: a is told and keeps it; nothing else is contestable
+    expect(pool.post(b.owner, [], 0, 10)).toEqual([{ priority: 9 }])
+    expect(yielded).toEqual([low])
+    expect(a.evicted).toEqual([])
+    expect(b.place(pool, "b1", 60, 9)).toBe(-1)
+    // A yielding slot is not claimed twice
+    pool.post(b.owner, [{ priority: 9 }], 0, 70)
+    pool.settle(70)
+    expect(yielded).toEqual([low])
+    expect(pool.availableSlots(105)).toBe(0)
+    expect(pool.availableSlots(110)).toBe(1)
+    expect(b.place(pool, "b1", 110, 9)).toBe(low)
+    expect(a.evicted).toEqual(["a-low"])
+  })
+
   it("does not raise the scale while wants can be met by contesting", () => {
     const pool = new ResidencyPool({ slots: 2, protectMs: 10_000, budgetIntervalMs: 100 })
     const a = makeOwner()
