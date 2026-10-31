@@ -1,6 +1,6 @@
 # Tethys
 
-A shared fetch pool for modules that stream: one connection budget, priorities that cross module boundaries, and a bandwidth figure. Optional; [Atlas](https://github.com/nickpaustian/atlas) and [Theia](https://github.com/nickpaustian/theia) each stream on their own without it, and take a client of it when both are present.
+Shared budgets for modules that stream. A **fetch pool**: one connection budget, priorities that cross module boundaries, and a bandwidth figure. A **residency pool**: one memory budget of equal slots shared by many owners, with eviction, ranking and a detail scale across them. Both are engine-free. [Atlas](https://github.com/nickpaustian/atlas) and [Theia](https://github.com/nickpaustian/theia) build their shared atlases and arenas on the residency pool, and take a client of the fetch pool when one is given.
 
 Tethys is the Titaness of the fresh water that feeds every river, which is what the pool is to the modules that drink from it.
 
@@ -10,7 +10,7 @@ Tethys is the Titaness of the fresh water that feeds every river, which is what 
 npm install @nickpaustian/tethys
 ```
 
-No dependencies. Atlas and Theia do not depend on this package: each declares its own `PoolClient` interface (`submit` returning a ticket with `setPriority`, `cancel` and `started`), which Tethys's client satisfies, as does any object with the same shape.
+No dependencies. Atlas and Theia depend on it for `ResidencyPool`. For the fetch pool they declare their own `PoolClient` interface (`submit` returning a ticket with `setPriority`, `cancel` and `started`), which Tethys's client satisfies, as does any object with the same shape.
 
 ## Why
 
@@ -76,11 +76,56 @@ ticket.started            // true once the run has begun
 | `bytesPerSecond` | received bytes over the last `bandwidthWindowMs` |
 | `clients[]` | per client: `name`, `weight`, `reserve`, `queued`, `inFlight`, `started`, `bytes` |
 
+## Residency pool
+
+Many owners keeping things resident in one store of equal slots: geometry pages in a vertex arena, tiles in a texture atlas, anything with a fixed cost per slot. The storage stays with whoever owns it; the pool decides which slot each new thing goes in and which owner loses one, so a scene's objects share one budget and detail goes where the screen needs it.
+
+```ts
+import { ResidencyPool, type ResidencyOwner } from "@nickpaustian/tethys"
+
+const pool = new ResidencyPool({ slots: 4096 })
+
+const owner: ResidencyOwner = {
+  pinned: (slot) => slot === myRootSlot,        // never taken (a root page)
+  evict: (slot) => forget(slot),                // the pool gave this slot to someone else
+}
+
+// Each frame: offer what is wanted, with priorities every owner shares (projected error in
+// pixels, screen coverage), and how many are already in flight; act on what is granted
+for (const want of pool.offer(owner, wanted, inFlight, performance.now())) request(want)
+
+// When something arrives
+const slot = pool.allocate(owner, performance.now())   // -1 when every slot is protected or pinned
+pool.touch(slot, performance.now())                    // used this frame: protected for protectMs
+
+detail.threshold = pixelError * pool.scale             // or a texture lod bias of log2(pool.scale)
+pool.release(owner)                                    // the owner goes: its slots are free
+```
+
+- **Eviction.** Slots go free first, then least recently used across owners. The owner of a slot taken is told through `evict` before `allocate` returns. A slot touched within `protectMs`, or `pinned` by its owner, is never taken.
+- **Ranking.** Each owner offers what it wants with priorities and how many it has in flight; the pool ranks every owner's latest offer together and grants the asking owner only those of its wants that fall within the free capacity, after every owner's in-flight count. No owner waits on another: an offer older than `offerMs` no longer counts, so an owner that stops offering (frozen, off screen) holds no share.
+- **Scale.** Ranking only shares out free capacity; once every slot is protected nothing moves. `scale` then rises (× `raiseBy`) while more is wanted than fits and nothing was placed in the last `budgetIntervalMs`, and falls back toward 1 (÷ `easeBy`) once wants are met and `budgetHeadroom` of the slots is free. Owners apply it to their own detail measure, so every owner coarsens evenly.
+
+`new ResidencyPool(options)`:
+
+| option | default | meaning |
+| --- | --- | --- |
+| `slots` | required | things resident at once across every owner |
+| `protectMs` | 500 | milliseconds a used slot is safe from being taken |
+| `offerMs` | 250 | milliseconds an owner's offer counts in the ranking |
+| `budget` | true | whether `scale` follows what fits; off, it stays where it is |
+| `budgetIntervalMs` | 600 | milliseconds between scale decisions; keep it longer than `protectMs` |
+| `budgetHeadroom` | 0.1 | free share of the slots below which the scale is not lowered |
+| `raiseBy`, `easeBy` | 1.25, 1.1 | the scale's steps up and down (Atlas uses √2 and 2^¼, half a level up and a quarter down) |
+| `maxScale` | 64 | largest the scale may grow |
+
+`pool.stats` gives `owners`, `slots`, `freeSlots` and `scale`; `pool.statsOf(owner)` its `slots`, `wanted` and `pending`. `vacantSlots`, `availableSlots(now)` and `ownerOf(slot)` read the state; `free(slot)` gives one slot back; `join(owner)` counts an owner before it holds anything.
+
 ## Development
 
 ```
 npm ci
-npm test            # vitest: ordering, re-prioritising and cancelling, slot accounting, the bandwidth window
+npm test            # vitest: ordering, re-prioritising and cancelling, slot accounting, the bandwidth window; residency eviction, protection and pins, ranking across owners, offers ageing out, the scale
 npm run typecheck
 npm run build       # dist/
 ```
