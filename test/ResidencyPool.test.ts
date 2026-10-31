@@ -50,17 +50,31 @@ describe("ResidencyPool", () => {
     expect(a.evicted).toEqual([])
   })
 
-  it("ranks every owner's offer together and grants each only its share of the free slots", () => {
+  it("ranks every owner's post together at a settle and grants each its share of the free slots", () => {
     const pool = new ResidencyPool({ slots: 4, budget: false })
     const a = makeOwner()
     const b = makeOwner()
     b.place(pool, "b0", 0)
     // Three free slots and one pending fetch of a's: two to share out
-    pool.offer(b.owner, [{ priority: 9, id: "b-high" }, { priority: 1, id: "b-low" }], 0, 0)
-    const forA = pool.offer(a.owner, [{ priority: 5, id: "a-mid" }, { priority: 2, id: "a-low" }], 1, 1)
-    expect(forA.map((w) => w.id)).toEqual(["a-mid"])
-    const forB = pool.offer(b.owner, [{ priority: 9, id: "b-high" }, { priority: 1, id: "b-low" }], 0, 2)
-    expect(forB.map((w) => w.id)).toEqual(["b-high"])
+    expect(pool.post(b.owner, [{ priority: 9, id: "b-high" }, { priority: 1, id: "b-low" }], 0, 0)).toEqual([])
+    pool.post(a.owner, [{ priority: 5, id: "a-mid" }, { priority: 2, id: "a-low" }], 1, 0)
+    pool.settle(1)
+    expect(pool.post(a.owner, [], 0, 2).map((w) => w.id)).toEqual(["a-mid"])
+    expect(pool.post(b.owner, [], 0, 2).map((w) => w.id)).toEqual(["b-high"])
+    expect(pool.statsOf(a.owner)).toMatchObject({ wanted: 2, pending: 1 })
+  })
+
+  it("settles by itself when an owner posts again, a frame late, and counts an owner that did not post as wanting nothing", () => {
+    const pool = new ResidencyPool({ slots: 1, budget: false })
+    const a = makeOwner()
+    const b = makeOwner()
+    pool.post(a.owner, [{ priority: 9 }], 0, 0)
+    pool.post(b.owner, [{ priority: 1 }], 0, 0)
+    // a's second post settles the first frame: a outranks b for the one slot
+    expect(pool.post(a.owner, [], 0, 16)).toEqual([{ priority: 9 }])
+    expect(pool.post(b.owner, [{ priority: 1 }], 0, 16)).toEqual([])
+    // a stopped asking, so the next settle gives b the slot
+    expect(pool.post(b.owner, [{ priority: 1 }], 0, 32)).toEqual([{ priority: 1 }])
   })
 
   it("lets another owner's want take a protected slot it is worth more than, least valued first, never the owner's own or a pinned one", () => {
@@ -70,11 +84,17 @@ describe("ResidencyPool", () => {
     a.place(pool, "root", 0, 100)
     a.place(pool, "low", 0, 2)
     a.place(pool, "mid", 0, 4)
+    const decide = (wants: { priority: number }[], now: number) => {
+      pool.post(b.owner, wants, 0, now)
+      pool.settle(now)
+      return pool.post(b.owner, [], 0, now)
+    }
     // All protected: a's own want cannot take its own slots, b's must beat a value by 1.5x
     expect(a.place(pool, "a-more", 10, 50)).toBe(-1)
-    expect(pool.offer(b.owner, [{ priority: 2.5 }], 0, 10)).toEqual([])
-    // 7 beats "low" (2); 3.5 would need more than 1.5 x "mid" (4); "root" is pinned
-    expect(pool.offer(b.owner, [{ priority: 7 }, { priority: 3.5 }, { priority: 1 }], 0, 10)).toEqual([{ priority: 7 }])
+    expect(decide([{ priority: 2.5 }], 10)).toEqual([])
+    // 7 beats "low" (2); 6.5 would need more than 1.5 x "mid" (4), and "low" is spoken for; "root" is pinned
+    expect(decide([{ priority: 7 }, { priority: 5.5 }, { priority: 1 }], 10)).toEqual([{ priority: 7 }])
+    expect(decide([{ priority: 7 }, { priority: 6.5 }], 10)).toEqual([{ priority: 7 }, { priority: 6.5 }])
     expect(b.place(pool, "b1", 20, 7)).toBeGreaterThanOrEqual(0)
     expect(a.evicted).toEqual(["low"])
     // b's new slot carries its want's value, so a cannot take it back for less
@@ -90,23 +110,18 @@ describe("ResidencyPool", () => {
     const b = makeOwner()
     a.place(pool, "a1", 0, 1)
     a.place(pool, "a2", 0, 1)
-    pool.offer(b.owner, [{ priority: 5 }], 0, 100)
+    const frame = (priority: number, now: number) => {
+      pool.post(b.owner, [{ priority }], 0, now)
+      pool.settle(now)
+    }
+    frame(5, 100)
     expect(b.place(pool, "b1", 150, 5)).toBeGreaterThanOrEqual(0)
-    pool.offer(b.owner, [{ priority: 5 }], 0, 200)
-    pool.offer(b.owner, [{ priority: 5 }], 0, 300)
+    frame(5, 200)
+    frame(5, 300)
     expect(pool.scale).toBe(1)
     // Worth too little to contest a2: stuck, so the scale rises
-    pool.offer(b.owner, [{ priority: 1.2 }], 0, 400)
+    frame(1.2, 400)
     expect(pool.scale).toBeCloseTo(1.25)
-  })
-
-  it("lets an offer age out, so an owner that stops asking holds no share", () => {
-    const pool = new ResidencyPool({ slots: 1, budget: false, offerMs: 100 })
-    const a = makeOwner()
-    const b = makeOwner()
-    pool.offer(a.owner, [{ priority: 9 }], 0, 0)
-    expect(pool.offer(b.owner, [{ priority: 1 }], 0, 50)).toEqual([])
-    expect(pool.offer(b.owner, [{ priority: 1 }], 0, 200)).toEqual([{ priority: 1 }])
   })
 
   it("raises the scale while stuck, holds it with the budget off, and eases it once there is room", () => {
@@ -114,17 +129,21 @@ describe("ResidencyPool", () => {
     const a = makeOwner()
     a.place(pool, "a1", 0)
     a.place(pool, "a2", 0)
-    pool.offer(a.owner, [{ priority: 1 }], 0, 100)
-    pool.offer(a.owner, [{ priority: 1 }], 0, 200)
+    const frame = (wants: { priority: number }[], now: number) => {
+      pool.post(a.owner, wants, 0, now)
+      pool.settle(now)
+    }
+    frame([{ priority: 1 }], 100)
+    frame([{ priority: 1 }], 200)
     expect(pool.scale).toBeCloseTo(1.25)
-    pool.offer(a.owner, [{ priority: 1 }], 0, 300)
+    frame([{ priority: 1 }], 300)
     expect(pool.scale).toBeCloseTo(1.5625)
     pool.budget = false
-    pool.offer(a.owner, [{ priority: 1 }], 0, 400)
+    frame([{ priority: 1 }], 400)
     expect(pool.scale).toBeCloseTo(1.5625)
     pool.budget = true
     pool.release(a.owner)
-    pool.offer(a.owner, [], 0, 500)
+    frame([], 500)
     expect(pool.scale).toBeCloseTo(1.5625 / 1.1)
   })
 

@@ -90,9 +90,9 @@ const owner: ResidencyOwner = {
   evict: (slot) => forget(slot),                // the pool gave this slot to someone else
 }
 
-// Each frame: offer what is wanted, with priorities every owner shares (projected error in
-// pixels, screen coverage), and how many are already in flight; act on what is granted
-for (const want of pool.offer(owner, wanted, inFlight, performance.now())) request(want)
+// Each frame: post what is wanted, with priorities every owner shares (projected error in
+// pixels, screen coverage), and how many are in flight; act on what the last settle granted
+for (const want of pool.post(owner, wanted, inFlight, performance.now())) request(want)
 
 // When something arrives, with the priority it was wanted at
 const slot = pool.allocate(owner, performance.now(), priority)   // -1 when none can be had
@@ -106,7 +106,7 @@ pool.release(owner)                                    // the owner goes: its sl
 
 - **Eviction.** Slots go free first, then least recently used across owners. The owner of a slot taken is told through `evict` before `allocate` returns. A slot `pinned` by its owner is never taken.
 - **Contesting.** A slot touched within `protectMs` is safe from LRU and from its own owner's wants, but not from another owner whose want is worth more than `contestMargin` times the slot's value (the least valued goes first). So an owner arriving to a full pool gets what others hold for less than it is worth to it, and the split between owners follows what each one's detail is worth rather than who came first. The margin keeps two owners with like needs from trading slots back and forth. Values come from `touch(slot, now, value)`, in the measure wants are ranked by; a slot never given one is never contested (`allocate` gives it the priority it was claimed with).
-- **Ranking.** Each owner offers what it wants with priorities and how many it has in flight; the pool ranks every owner's latest offer together and grants the asking owner those of its wants that fall within the free capacity, after every owner's in-flight count, and those further down that can contest a slot. No owner waits on another: an offer older than `offerMs` no longer counts, so an owner that stops offering (frozen, off screen) holds no share.
+- **Ranking, once a frame.** Each owner posts what it wants with priorities and how many it has in flight. `settle(now)` ranks every post since the last settle in one pass: the highest wants take the free capacity left after every owner's in-flight count, those further down whatever slots they can contest, and the scale is judged once. `post` returns the owner's grants from the last settle, so wants are acted on a frame after they are posted; act on those still wanted. The pool settles by itself when an owner posts a second time, since a new frame has begun, so a host need not call `settle`; calling it after every owner's update decides within the frame instead. An owner that posted nothing counts as wanting nothing, so one that stops updating (frozen, off screen) holds no share of what is handed out. The decision is the same whatever order owners update in, and costs one ranking a frame however many owners there are.
 - **Scale.** Once nothing is free and nothing is worth contesting, nothing moves. `scale` then rises (× `raiseBy`) while more is wanted than fits and nothing was placed in the last `budgetIntervalMs`, and falls back toward 1 (÷ `easeBy`) once wants are met and `budgetHeadroom` of the slots is free. Owners apply it to their own detail measure, so every owner coarsens evenly.
 
 `new ResidencyPool(options)`:
@@ -115,7 +115,6 @@ pool.release(owner)                                    // the owner goes: its sl
 | --- | --- | --- |
 | `slots` | required | things resident at once across every owner |
 | `protectMs` | 500 | milliseconds a used slot is safe from being taken |
-| `offerMs` | 250 | milliseconds an owner's offer counts in the ranking |
 | `contestMargin` | 1.5 | how many times a protected slot's value another owner's want must exceed to take it |
 | `budget` | true | whether `scale` follows what fits; off, it stays where it is |
 | `budgetIntervalMs` | 600 | milliseconds between scale decisions; keep it longer than `protectMs` |
@@ -129,7 +128,7 @@ pool.release(owner)                                    // the owner goes: its sl
 
 ```
 npm ci
-npm test            # vitest: ordering, re-prioritising and cancelling, slot accounting, the bandwidth window; residency eviction, protection and pins, contesting by value, ranking across owners, offers ageing out, the scale
+npm test            # vitest: ordering, re-prioritising and cancelling, slot accounting, the bandwidth window; residency eviction, protection and pins, contesting by value, ranking across owners at a settle, settling by itself a frame late, the scale
 npm run typecheck
 npm run build       # dist/
 ```

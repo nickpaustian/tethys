@@ -5,8 +5,8 @@ export interface ResidencyOwner {
   evict(slot: number): void
 }
 
-export interface ResidencyOffer {
-  // In a measure every owner shares (projected error in pixels, screen coverage), so offers
+export interface ResidencyWant {
+  // In a measure every owner shares (projected error in pixels, screen coverage), so wants
   // rank across owners
   priority: number
 }
@@ -16,8 +16,6 @@ export interface ResidencyPoolOptions {
   slots: number
   // Milliseconds a used slot is safe from being taken
   protectMs?: number
-  // Milliseconds an owner's offer counts in the ranking after it was made
-  offerMs?: number
   // How many times a slot's value another owner's want must exceed to take it while it is
   // protected; above 1 so two owners with like needs do not trade the same slots back and forth
   contestMargin?: number
@@ -62,11 +60,15 @@ export interface ResidencyPoolStats {
 // between owners follows what each one's detail is worth rather than who came first. A slot
 // given no value is never contested.
 //
-// Requests are ranked across owners too. Each owner offers what it wants with priorities and
-// how many it already has in flight; the pool ranks every owner's latest offer together and
-// grants the asking owner only those of its wants that fall within the free capacity. No owner
-// waits on another, so one that stops offering (frozen, off screen) stalls nothing; its last
-// offer ages out.
+// Requests are ranked across owners once a frame. Each owner posts what it wants with
+// priorities and how many it already has in flight; `settle` ranks every post since the last
+// settle together, grants the highest the free capacity and the rest whatever slots they can
+// contest, and judges the scale, all in one pass. A post returns the owner's grants from the
+// last settle, so wants are acted on a frame after they are posted. The pool settles by itself
+// when an owner posts a second time, since a new frame has then begun, so hosts need not call
+// it; one may call it after every owner's update to decide within the frame. An owner that
+// posted nothing counts as wanting nothing, so one that stops updating (frozen, off screen)
+// holds no share of what is handed out.
 //
 // Once nothing is free and nothing is worth contesting, nothing moves, so the budget works on
 // what is wanted instead: `scale` rises while more is wanted than fits and
@@ -76,7 +78,6 @@ export interface ResidencyPoolStats {
 export default class ResidencyPool {
   public readonly slots: number
   public protectMs: number
-  public offerMs: number
   public contestMargin: number
   public budget: boolean
   public budgetIntervalMs: number
@@ -95,13 +96,15 @@ export default class ResidencyPool {
   private allocations: number = 0
   private allocationsAtBudget: number = 0
   private lastBudget: number = -Infinity
-  private readonly offers: Map<ResidencyOwner, { at: number; pending: number; wanted: ResidencyOffer[] }> = new Map()
+  // What each owner posted since the last settle, what the last settle ranked, and its grants
+  private posts: Map<ResidencyOwner, { pending: number; wanted: ResidencyWant[] }> = new Map()
+  private settled: Map<ResidencyOwner, { pending: number; wanted: ResidencyWant[] }> = new Map()
+  private readonly grants: Map<ResidencyOwner, ResidencyWant[]> = new Map()
   private readonly members: Set<ResidencyOwner> = new Set()
 
   constructor({
     slots,
     protectMs = 500,
-    offerMs = 250,
     contestMargin = 1.5,
     budget = true,
     budgetIntervalMs = 600,
@@ -113,7 +116,6 @@ export default class ResidencyPool {
     if (!(slots >= 1)) throw new Error(`ResidencyPool: needs at least one slot, got ${slots}`)
     this.slots = Math.floor(slots)
     this.protectMs = protectMs
-    this.offerMs = offerMs
     this.contestMargin = contestMargin
     this.budget = budget
     this.budgetIntervalMs = budgetIntervalMs
@@ -213,51 +215,69 @@ export default class ResidencyPool {
     this.freeSlots[this.freeSlotCount++] = slot
   }
 
-  // Offer what `owner` wants and how many it has in flight; returns the wants it may act on
-  // now. Every owner's latest offer is ranked together: the highest take the free capacity left
-  // once every owner's pending ones are counted, and the rest may each claim a protected slot of
-  // another owner that they contest, least valued first
-  public offer<T extends ResidencyOffer>(owner: ResidencyOwner, wanted: T[], pending: number, now: number): T[] {
+  // Post what `owner` wants this frame and how many it has in flight, replacing its last post;
+  // returns its grants from the last settle, which it should act on as far as they are still
+  // wanted. Settles first if the owner already posted since the last settle
+  public post<T extends ResidencyWant>(owner: ResidencyOwner, wanted: T[], pending: number, now: number): T[] {
     this.members.add(owner)
-    this.offers.set(owner, { at: now, pending, wanted })
+    if (this.posts.has(owner)) this.settle(now)
+    this.posts.set(owner, { pending, wanted })
+    const granted = this.grants.get(owner) ?? []
+    this.grants.delete(owner)
+    return granted as T[]
+  }
+
+  // Ranks every post since the last settle: the highest wants take the free capacity left once
+  // every owner's in-flight count is taken off, the rest each claim a protected slot of another
+  // owner that they contest, least valued first. Then judges the scale
+  public settle(now: number): void {
+    this.settled = this.posts
+    this.posts = new Map()
+    this.grants.clear()
     let free = this.availableSlots(now)
-    const ranked: Array<{ owner: ResidencyOwner; offer: ResidencyOffer }> = []
-    for (const [who, o] of this.offers) {
-      if (now - o.at > this.offerMs) {
-        this.offers.delete(who)
-        continue
-      }
-      free -= o.pending
-      for (const w of o.wanted) ranked.push({ owner: who, offer: w })
+    const ranked: Array<{ owner: ResidencyOwner; want: ResidencyWant }> = []
+    for (const [owner, post] of this.settled) {
+      free -= post.pending
+      for (const want of post.wanted) ranked.push({ owner, want })
     }
-    ranked.sort((a, b) => b.offer.priority - a.offer.priority)
-    const granted: T[] = []
+    ranked.sort((a, b) => b.want.priority - a.want.priority)
     let placeable = 0
-    let contestable: Array<{ owner: ResidencyOwner; value: number }> | null = null
-    for (const { owner: who, offer: want } of ranked) {
+    let contestable: Array<{ owner: ResidencyOwner; value: number; taken: boolean }> | null = null
+    let cheapest = 0
+    for (const { owner, want } of ranked) {
       if (free > 0) {
         free--
       } else {
         contestable ??= this.contestable(now)
-        const at = contestable.findIndex((c) => c.owner !== who && want.priority > c.value * this.contestMargin)
+        // The claim is the cheapest untaken slot of another owner below the want's limit
+        while (cheapest < contestable.length && contestable[cheapest].taken) cheapest++
+        const limit = want.priority / this.contestMargin
+        let at = -1
+        for (let i = cheapest; i < contestable.length && contestable[i].value < limit; i++) {
+          if (!contestable[i].taken && contestable[i].owner !== owner) {
+            at = i
+            break
+          }
+        }
         if (at === -1) continue
-        contestable.splice(at, 1)
+        contestable[at].taken = true
       }
       placeable++
-      if (who === owner) granted.push(want as T)
+      let list = this.grants.get(owner)
+      if (!list) this.grants.set(owner, (list = []))
+      list.push(want)
     }
     this.adjustBudget(now, placeable)
-    return granted
   }
 
   // Protected slots that hold a value, least valued first
-  private contestable(now: number): Array<{ owner: ResidencyOwner; value: number }> {
+  private contestable(now: number): Array<{ owner: ResidencyOwner; value: number; taken: boolean }> {
     const minUsed = now - this.protectMs
-    const slots: Array<{ owner: ResidencyOwner; value: number }> = []
+    const slots: Array<{ owner: ResidencyOwner; value: number; taken: boolean }> = []
     for (let s = 0; s < this.slots; s++) {
       const holder = this.owners[s]
       if (holder === null || this.lastUsed[s] < minUsed || this.values[s] === Infinity || holder.pinned(s)) continue
-      slots.push({ owner: holder, value: this.values[s] })
+      slots.push({ owner: holder, value: this.values[s], taken: false })
     }
     return slots.sort((a, b) => a.value - b.value)
   }
@@ -266,9 +286,9 @@ export default class ResidencyPool {
     if (!this.budget || now - this.lastBudget < this.budgetIntervalMs) return
     let wanted = 0
     let pending = 0
-    for (const o of this.offers.values()) {
-      wanted += o.wanted.length
-      pending += o.pending
+    for (const post of this.settled.values()) {
+      wanted += post.wanted.length
+      pending += post.pending
     }
     const placed = this.allocations - this.allocationsAtBudget
     this.allocationsAtBudget = this.allocations
@@ -277,18 +297,20 @@ export default class ResidencyPool {
     else if (wanted === 0 && pending === 0 && this.scale > 1 && this.availableSlots(now) > this.slots * this.budgetHeadroom) this.scale = Math.max(1, this.scale / this.easeBy)
   }
 
-  // Forget an owner: its slots are free and its offer withdrawn. It is not told
+  // Forget an owner: its slots are free and its posts and grants withdrawn. It is not told
   public release(owner: ResidencyOwner): void {
     for (let slot = 0; slot < this.slots; slot++) if (this.owners[slot] === owner) this.free(slot)
-    this.offers.delete(owner)
+    this.posts.delete(owner)
+    this.settled.delete(owner)
+    this.grants.delete(owner)
     this.members.delete(owner)
   }
 
   public statsOf(owner: ResidencyOwner): ResidencyOwnerStats {
     let slots = 0
     for (let slot = 0; slot < this.slots; slot++) if (this.owners[slot] === owner) slots++
-    const offer = this.offers.get(owner)
-    return { slots, wanted: offer?.wanted.length ?? 0, pending: offer?.pending ?? 0 }
+    const post = this.settled.get(owner)
+    return { slots, wanted: post?.wanted.length ?? 0, pending: post?.pending ?? 0 }
   }
 
   public get stats(): ResidencyPoolStats {
