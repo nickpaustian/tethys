@@ -1,6 +1,6 @@
 # Tethys
 
-Shared budgets for modules that stream. A **fetch pool**: one connection budget, priorities that cross module boundaries, and a bandwidth figure. A **residency pool**: one memory budget of equal slots shared by many owners, with eviction, ranking and a detail scale across them. Both are engine-free. [Atlas](https://github.com/nickpaustian/atlas) and [Theia](https://github.com/nickpaustian/theia) build their shared atlases and arenas on the residency pool, and take a client of the fetch pool when one is given.
+Shared budgets for modules that stream. A **fetch pool**: one connection budget, priorities that cross module boundaries, and a bandwidth figure. A **residency pool**: one memory budget of equal slots shared by many owners, with eviction, ranking and a detail scale across them. A **readback gate**: one GPU readback a frame across everything on a WebGL2 context. All are engine-free. [Atlas](https://github.com/nickpaustian/atlas) and [Theia](https://github.com/nickpaustian/theia) build their shared atlases and arenas on the residency pool, and take a client of the fetch pool when one is given.
 
 Tethys is the Titaness of the fresh water that feeds every river, which is what the pool is to the modules that drink from it.
 
@@ -133,6 +133,20 @@ pool.release(owner)                                    // the owner goes: its sl
 | `maxScale` | 64 | largest the scale may grow |
 
 `pool.stats` gives `owners`, `slots`, `freeSlots`, `scale` and `cutoff`; `pool.statsOf(owner)` its `slots`, `wanted` and `pending`. `vacantSlots`, `availableSlots(now)` and `ownerOf(slot)` read the state; `free(slot)` gives one slot back; `join(owner)` counts an owner before it holds anything.
+
+## Readback gate
+
+GPU readbacks share a budget too. In Chrome, reading a pixel pack buffer back (`getBufferSubData`) is a synchronous call to the GPU process even behind a signalled fence, and it waits for whatever that process still has queued: right after a frame of uploads, tens of milliseconds. `ReadbackGate` fences the end of every frame and lets one read through a frame, only once the frame before has finished on the GPU, to whichever reader asking has waited longest since its last read.
+
+```ts
+import { ReadbackGate } from "@nickpaustian/tethys"
+
+if (gl.getSyncParameter(fence, gl.SYNC_STATUS) !== gl.SIGNALED) return
+if (!ReadbackGate.for(gl).request(this)) return // the data waits in its buffer; ask again next frame
+gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, buffer)
+```
+
+`ReadbackGate.for(gl)` is the one gate for a context. The end of a frame is found by a microtask queued on the first ask, so ask from inside the animation frame callback. Theia's visibility pass and Atlas's feedback pass both read through it. `gate.stats` gives `granted` and `refused`.
 
 ## Development
 
