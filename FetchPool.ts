@@ -1,6 +1,8 @@
 export interface FetchPoolOptions {
-  // Fetches in flight at once across every client
-  concurrency?: number
+  // Fetches in flight at once across every client. "auto", the default, starts at 12 and
+  // rises to 48 once a response is seen to have come over HTTP/2 or HTTP/3, which multiplex
+  // many requests on one connection; over HTTP/1.1 the browser allows about 6 a host anyway
+  concurrency?: number | "auto"
   // Milliseconds of received bytes the bandwidth estimate averages over
   bandwidthWindowMs?: number
 }
@@ -26,6 +28,9 @@ export interface PoolTicket {
 export interface PoolRunContext {
   // Report bytes as they arrive so the pool can measure bandwidth
   progress: (bytes: number) => void
+  // Report the URL a response came from once its body is read; with concurrency "auto" the
+  // pool reads its protocol from Resource Timing
+  fetched: (url: string) => void
 }
 
 export type PoolRun = (context: PoolRunContext) => Promise<void>
@@ -42,6 +47,8 @@ export interface PoolClientStats {
 
 export interface FetchPoolStats {
   concurrency: number
+  // The protocol responses came over, once learned ("" until then)
+  protocol: string
   inFlight: number
   queued: number
   // Over the bandwidth window
@@ -63,8 +70,18 @@ interface Entry {
 // priority normalised within itself; the pool starts the highest weight x priority across
 // clients whenever a slot is free and measures the bytes they bring in, so one bandwidth figure
 // can drive every module's detail cap.
+const AUTO_CONCURRENCY = 12
+const MULTIPLEXED_CONCURRENCY = 48
+// Responses checked for a protocol before giving up (cross-origin hosts without
+// Timing-Allow-Origin may not report one)
+const PROTOCOL_CHECKS = 16
+
 export default class FetchPool {
-  public readonly concurrency: number
+  public concurrency: number
+  // The protocol responses came over, once learned ("" until then)
+  public protocol: string = ""
+  private auto: boolean
+  private protocolChecks: number = 0
   private readonly bandwidthWindowMs: number
   private waiting: Entry[] = []
   private inFlight: number = 0
@@ -74,8 +91,9 @@ export default class FetchPool {
   private buckets: Array<{ at: number; bytes: number }> = []
   private clients: Map<string, PoolClient> = new Map()
 
-  constructor({ concurrency = 12, bandwidthWindowMs = 2000 }: FetchPoolOptions = {}) {
-    this.concurrency = concurrency
+  constructor({ concurrency = "auto", bandwidthWindowMs = 2000 }: FetchPoolOptions = {}) {
+    this.auto = concurrency === "auto"
+    this.concurrency = concurrency === "auto" ? AUTO_CONCURRENCY : concurrency
     this.bandwidthWindowMs = bandwidthWindowMs
   }
 
@@ -143,12 +161,27 @@ export default class FetchPool {
           entry.client.onBytes(bytes)
           this.record(bytes)
         },
+        fetched: (url) => this.learnProtocol(url),
       }
       entry.run(context).catch(() => undefined).finally(() => {
         this.inFlight--
         entry.client.onFinish()
         this.pump()
       })
+    }
+  }
+
+  private learnProtocol(url: string): void {
+    if (this.protocol !== "" || this.protocolChecks >= PROTOCOL_CHECKS) return
+    if (typeof performance === "undefined" || typeof performance.getEntriesByName !== "function") return
+    this.protocolChecks++
+    const entries = performance.getEntriesByName(url, "resource") as PerformanceResourceTiming[]
+    const protocol = entries[entries.length - 1]?.nextHopProtocol ?? ""
+    if (protocol === "") return
+    this.protocol = protocol
+    if (this.auto && (protocol === "h2" || protocol.startsWith("h3"))) {
+      this.concurrency = MULTIPLEXED_CONCURRENCY
+      this.pump()
     }
   }
 
@@ -173,6 +206,7 @@ export default class FetchPool {
   public get stats(): FetchPoolStats {
     return {
       concurrency: this.concurrency,
+      protocol: this.protocol,
       inFlight: this.inFlight,
       queued: this.waiting.length,
       bytesPerSecond: this.bytesPerSecond,

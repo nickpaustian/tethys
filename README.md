@@ -38,7 +38,7 @@ Theia submits a ticket per page and gathers its coalesced range request only whe
 
 | option | default | meaning |
 | --- | --- | --- |
-| `concurrency` | 12 | fetches in flight at once across every client |
+| `concurrency` | `"auto"` | fetches in flight at once across every client. `"auto"` starts at 12 and rises to 48 once a response is seen to have come over HTTP/2 or HTTP/3, which multiplex requests on one connection (read from Resource Timing's `nextHopProtocol` for the URL a client reports through `fetched`; a cross-origin host needs `Timing-Allow-Origin` to report it). A number fixes it |
 | `bandwidthWindowMs` | 2000 | milliseconds of received bytes the bandwidth estimate averages over |
 
 `pool.client(name, options)` returns the client for `name`, creating it on first use:
@@ -53,9 +53,10 @@ Theia submits a ticket per page and gathers its coalesced range request only whe
 ```ts
 const client = pool.client("tiles", { weight: 0.8 })
 
-const ticket = client.submit(priority, async ({ progress }) => {
+const ticket = client.submit(priority, async ({ progress, fetched }) => {
   const response = await fetch(url)
   for await (const chunk of response.body) progress(chunk.byteLength)
+  fetched(response.url)
 }, () => { /* called if the ticket is cancelled before it starts */ })
 
 ticket.setPriority(0.4)   // while still waiting
@@ -63,7 +64,7 @@ ticket.cancel()           // withdraw a waiting request
 ticket.started            // true once the run has begun
 ```
 
-`submit(priority, run, onCancel?)` queues a run and returns a ticket. `client.inFlight` is how many of its runs are going. `run` receives a context whose `progress(bytes)` feeds the bandwidth estimate; the slot is freed when the run's promise settles, however it settles. The pool never aborts a running fetch; that stays with the client. `client.weight` can be changed at any time.
+`submit(priority, run, onCancel?)` queues a run and returns a ticket. `client.inFlight` is how many of its runs are going. `run` receives a context whose `progress(bytes)` feeds the bandwidth estimate and whose `fetched(url)`, called with `response.url` once the body is read, lets an `"auto"` pool learn the protocol; the slot is freed when the run's promise settles, however it settles. The pool never aborts a running fetch; that stays with the client. `client.weight` can be changed at any time.
 
 ## Stats
 
@@ -72,6 +73,7 @@ ticket.started            // true once the run has begun
 | field | meaning |
 | --- | --- |
 | `concurrency` | the pool's budget |
+| `protocol` | the protocol responses came over (`"h2"`, `"http/1.1"`…), `""` until learned |
 | `inFlight`, `queued` | requests running and waiting across all clients |
 | `bytesPerSecond` | received bytes over the last `bandwidthWindowMs` |
 | `clients[]` | per client: `name`, `weight`, `reserve`, `queued`, `inFlight`, `started`, `bytes` |

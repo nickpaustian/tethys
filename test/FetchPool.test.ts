@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest"
+import { describe, it, expect, vi } from "vitest"
 import { FetchPool } from "../index.js"
 
 const deferred = () => {
@@ -154,5 +154,20 @@ describe("FetchPool", () => {
     const again = pool.client("a", { weight: 0.7 })
     expect(again).toBe(first)
     expect(first.weight).toBe(0.7)
+  })
+
+  it("raises concurrency once a response is seen over a multiplexed protocol, and only with auto", async () => {
+    const run = async (pool: FetchPool, protocol: string) => {
+      const spy = vi.spyOn(performance, "getEntriesByName").mockReturnValue([{ nextHopProtocol: protocol } as unknown as PerformanceEntry])
+      await new Promise<void>((resolve) => pool.client("a").submit(1, async ({ fetched }) => { fetched("https://host/page.bin"); resolve() }))
+      spy.mockRestore()
+      return pool.stats
+    }
+    expect(await run(new FetchPool(), "h2")).toMatchObject({ concurrency: 48, protocol: "h2" })
+    expect(await run(new FetchPool(), "h3")).toMatchObject({ concurrency: 48 })
+    expect(await run(new FetchPool(), "http/1.1")).toMatchObject({ concurrency: 12, protocol: "http/1.1" })
+    expect(await run(new FetchPool({ concurrency: 6 }), "h2")).toMatchObject({ concurrency: 6, protocol: "h2" })
+    // Nothing reported (a cross-origin host without Timing-Allow-Origin): unchanged, still asking
+    expect(await run(new FetchPool(), "")).toMatchObject({ concurrency: 12, protocol: "" })
   })
 })
