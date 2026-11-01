@@ -1,6 +1,6 @@
 {
   "name": "@nickpaustian/tethys",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Shared budgets for streaming modules: a fetch pool with one connection budget, cross-module priorities and a bandwidth estimate, and a residency pool for memory shared between owners",
   "type": "module",
   "license": "MIT",
