@@ -7,8 +7,9 @@ export interface ResidencyOwner {
   // The pool gave this slot to something else; forget what it held
   evict(slot: number): void
   // Optional: another owner has claimed this slot, which goes in yieldMs; stop using what it
-  // holds now (fade it out) so its going is not seen. Owners without it are evicted at once
-  yield?(slot: number): void
+  // holds now (fade it out) so its going is not seen. Return false when nothing of it is showing
+  // (off screen, not fading), and it goes at once. Owners without it are evicted at once
+  yield?(slot: number): void | boolean
 }
 
 export interface ResidencyWant {
@@ -199,6 +200,12 @@ export default class ResidencyPool {
     if (value !== undefined) this.values[slot] = value
   }
 
+  // What a slot's contents are worth, without counting it as used: 0 when its owner no longer
+  // needs it, so any want may claim it while it is still protected
+  public setValue(slot: number, value: number): void {
+    this.values[slot] = value
+  }
+
   public get vacantSlots(): number {
     return this.freeSlotCount
   }
@@ -252,8 +259,9 @@ export default class ResidencyPool {
         if (holder?.yield) {
           if (!claim) return -1
           this.yieldingAt[slot] = now
-          holder.yield(slot)
-          return CLAIMED
+          // An owner showing nothing of the slot says so, and it goes at once
+          if (holder.yield(slot) !== false) return CLAIMED
+          this.yieldingAt[slot] = -1
         }
       }
       if (slot === -1) return -1

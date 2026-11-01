@@ -136,6 +136,20 @@ describe("ResidencyPool", () => {
     expect(a.evicted).toEqual(["a-low"])
   })
 
+  it("gives a claimed slot at once when its owner shows nothing of it, and lets an owner drop a slot's value without using it", () => {
+    const pool = new ResidencyPool({ slots: 1, protectMs: 10_000, budget: false })
+    const a = makeOwner()
+    a.owner.yield = () => false
+    const b = makeOwner()
+    a.place(pool, "a1", 0, 100)
+    const slot = [...a.held.keys()][0]
+    // Worth too much to contest, until its owner says it no longer needs it
+    expect(pool.allocate(b.owner, 10, 9, true)).toBe(-1)
+    pool.setValue(slot, 0)
+    expect(pool.allocate(b.owner, 20, 9, true)).toBe(slot)
+    expect(a.evicted).toEqual(["a1"])
+  })
+
   it("with contestOwn, lets an owner alone in a full pool trade its own least valued slot for a want worth more", () => {
     const pool = new ResidencyPool({ slots: 2, protectMs: 10_000, budget: false, contestOwn: true })
     const a = makeOwner(["root"])
