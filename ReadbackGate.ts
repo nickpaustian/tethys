@@ -1,15 +1,23 @@
-// One GPU readback a frame for everything sharing a WebGL2 context, taken only once the GPU
-// process has caught up with the frame before.
+// GPU readbacks for everything sharing a WebGL2 context, taken together at the start of a frame
+// and only once the GPU process has caught up with the frame before.
 //
 // Reading a pixel pack buffer back (`getBufferSubData`) is a synchronous call to the GPU process
 // in Chrome, even behind a signalled fence: it waits for whatever that process still has queued.
 // Right after a frame of uploads that can be tens of milliseconds. The gate fences the end of
-// each frame and lets a read through only when the last frame's fence has signalled, at most one
-// a frame, to whichever reader asking has waited longest since its last read. A reader turned
-// away keeps its data in its buffer and asks again next frame.
+// each frame. Readers submit their fenced readbacks; the first time any reader asks in a frame,
+// before that frame has uploaded anything, every submitted readback whose own fence has
+// signalled is read, back to back, provided the last frame's fence has signalled too. Reads in
+// a row with nothing queued between them cost a fraction of a millisecond.
 //
-// The end of a frame is found without a hook into the loop: the first ask of a frame queues a
+// The end of a frame is found without a hook into the loop: the first call of a frame queues a
 // microtask, which runs once the animation frame callback (and the render in it) has returned.
+export interface Readback {
+  // Whether the reader's own fence has signalled
+  ready(): boolean
+  // Reads the data back (binds its buffer and calls getBufferSubData)
+  read(): void
+}
+
 export default class ReadbackGate {
   private static gates = new WeakMap<WebGL2RenderingContext, ReadbackGate>()
 
@@ -24,47 +32,54 @@ export default class ReadbackGate {
   private frameFence: WebGLSync | null = null
   private frameOpen = false
   private readThisFrame = false
-  private frame = 0
-  // Each reader's last read and last ask, by frame; one that stops asking drops out after a frame
-  private readAt = new Map<object, number>()
-  private askedAt = new Map<object, number>()
-  private granted = 0
-  private refused = 0
+  private submitted = new Map<object, Readback>()
+  private done = new Set<object>()
+  private reads = 0
+  private deferred = 0
 
   private constructor(gl: WebGL2RenderingContext) {
     this.gl = gl
   }
 
-  public get stats(): { granted: number; refused: number } {
-    return { granted: this.granted, refused: this.refused }
+  public get stats(): { reads: number; deferred: number; waiting: number } {
+    return { reads: this.reads, deferred: this.deferred, waiting: this.submitted.size }
   }
 
-  // Whether `reader` may read back now. A true answer is the frame's read: the caller reads at once
-  public request(reader: object): boolean {
+  // A readback to take at the start of a coming frame, in place of any the reader had waiting
+  public submit(reader: object, readback: Readback): void {
     this.openFrame()
-    const gl = this.gl
-    this.askedAt.set(reader, this.frame)
-    let allowed = !this.readThisFrame
-    if (allowed && this.frameFence) allowed = gl.getSyncParameter(this.frameFence, gl.SYNC_STATUS) === gl.SIGNALED
-    if (allowed) {
-      const mine = this.readAt.get(reader) ?? -1
-      for (const [other, asked] of this.askedAt) {
-        if (other === reader) continue
-        if (asked < this.frame - 1) {
-          this.askedAt.delete(other)
-          this.readAt.delete(other)
-        }
-        else if ((this.readAt.get(other) ?? -1) < mine) allowed = false
-      }
-    }
-    if (!allowed) {
-      this.refused++
-      return false
-    }
+    this.submitted.set(reader, readback)
+    this.done.delete(reader)
+  }
+
+  // Whether the reader's readback has been read since it was submitted; true once
+  public collected(reader: object): boolean {
+    this.openFrame()
+    if (!this.readThisFrame) this.readAll()
+    return this.done.delete(reader)
+  }
+
+  // Forgets the reader's readback, as when it is disposed
+  public cancel(reader: object): void {
+    this.submitted.delete(reader)
+    this.done.delete(reader)
+  }
+
+  private readAll(): void {
     this.readThisFrame = true
-    this.readAt.set(reader, this.frame)
-    this.granted++
-    return true
+    if (this.submitted.size === 0) return
+    const gl = this.gl
+    if (this.frameFence && gl.getSyncParameter(this.frameFence, gl.SYNC_STATUS) !== gl.SIGNALED) {
+      this.deferred++
+      return
+    }
+    for (const [reader, readback] of this.submitted) {
+      if (!readback.ready()) continue
+      readback.read()
+      this.submitted.delete(reader)
+      this.done.add(reader)
+      this.reads++
+    }
   }
 
   private openFrame(): void {
@@ -77,7 +92,6 @@ export default class ReadbackGate {
     const gl = this.gl
     this.frameOpen = false
     this.readThisFrame = false
-    this.frame++
     if (this.frameFence) gl.deleteSync(this.frameFence)
     this.frameFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0)
     gl.flush()

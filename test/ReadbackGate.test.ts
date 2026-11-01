@@ -22,6 +22,12 @@ const fakeContext = () => {
 }
 const endFrame = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
+// A reader whose own fence the test signals, counting its reads
+const reader = () => {
+  const r = { ready: false, reads: 0, readback: { ready: () => r.ready, read: () => r.reads++ } }
+  return r
+}
+
 describe("ReadbackGate", () => {
   it("is shared by everything on one context", () => {
     const { gl } = fakeContext()
@@ -29,50 +35,44 @@ describe("ReadbackGate", () => {
     expect(ReadbackGate.for(fakeContext().gl)).not.toBe(ReadbackGate.for(gl))
   })
 
-  it("lets one read through a frame, and none until the frame before has finished on the GPU", async () => {
+  it("reads every ready readback together at a frame's first ask, once the frame before has finished on the GPU", async () => {
     const { gl, catchUp } = fakeContext()
     const gate = ReadbackGate.for(gl)
-    const a = {}, b = {}
-    expect(gate.request(a)).toBe(true)
-    expect(gate.request(b)).toBe(false)
+    const a = reader(), b = reader(), c = reader()
+    gate.submit(a, a.readback)
+    gate.submit(b, b.readback)
+    gate.submit(c, c.readback)
+    a.ready = b.ready = true
+    // The frame before has not finished: nothing is read
     await endFrame()
-    expect(gate.request(b)).toBe(false)
+    expect(gate.collected(a)).toBe(false)
+    expect(a.reads).toBe(0)
     await endFrame()
     catchUp()
-    expect(gate.request(b)).toBe(true)
+    // The first ask reads both that are ready; c's own fence has not signalled
+    expect(gate.collected(b)).toBe(true)
+    expect([a.reads, b.reads, c.reads]).toEqual([1, 1, 0])
+    expect(gate.collected(b)).toBe(false)
+    expect(gate.collected(a)).toBe(true)
+    // Ready now, but a frame reads only at its first ask
+    c.ready = true
+    expect(gate.collected(c)).toBe(false)
+    await endFrame()
+    catchUp()
+    expect(gate.collected(c)).toBe(true)
+    expect(gate.stats).toMatchObject({ reads: 3, waiting: 0 })
   })
 
-  it("takes turns: a reader that read last gives way to one turned away", async () => {
+  it("forgets a cancelled readback", async () => {
     const { gl, catchUp } = fakeContext()
     const gate = ReadbackGate.for(gl)
-    const a = {}, b = {}
-    expect(gate.request(a)).toBe(true)
-    expect(gate.request(b)).toBe(false)
+    const a = reader()
+    a.ready = true
+    gate.submit(a, a.readback)
+    gate.cancel(a)
     await endFrame()
     catchUp()
-    expect(gate.request(a)).toBe(false)
-    expect(gate.request(b)).toBe(true)
-    await endFrame()
-    catchUp()
-    expect(gate.request(a)).toBe(true)
-  })
-
-  it("serves every reader in turn, however many ask, and forgets one that stops asking", async () => {
-    const { gl, catchUp } = fakeContext()
-    const gate = ReadbackGate.for(gl)
-    const readers = [{}, {}, {}]
-    const reads = [0, 0, 0]
-    for (let frame = 0; frame < 9; frame++) {
-      readers.forEach((r, i) => gate.request(r) && reads[i]++)
-      await endFrame()
-      catchUp()
-    }
-    expect(reads).toEqual([3, 3, 3])
-    const [a, b] = readers
-    for (let frame = 0; frame < 4; frame++) {
-      expect(gate.request(a) || gate.request(b)).toBe(true)
-      await endFrame()
-      catchUp()
-    }
+    expect(gate.collected(a)).toBe(false)
+    expect(a.reads).toBe(0)
   })
 })
