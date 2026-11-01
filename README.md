@@ -153,7 +153,9 @@ ReadbackGate.for(gl).submit(this, {
 if (ReadbackGate.for(gl).collected(this)) use(buffer)
 ```
 
-`ReadbackGate.for(gl)` is the one gate for a context. The end of a frame is found by a microtask queued on the first call, so call it from inside the animation frame callback. `cancel(reader)` forgets a readback (on dispose). Theia's visibility pass and Atlas's feedback pass both read through it. `gate.stats` gives `reads`, `deferred` (frames the GPU had not caught up) and `waiting`.
+The passes behind the readbacks (low-resolution redraws of the scene) take turns too: `gate.turn(reader)` grants one a frame across the context, to the reader asking that has waited longest since its last, so the frame carries at most one extra pass however many readers there are. In Chrome the cost of a pass is mostly the GPU process translating its commands rather than GPU time; orbiting two textured, occlusion-culled meshes at 120 Hz, frames that miss vsync fall by about 40% (median 170 to 97 in 950).
+
+`ReadbackGate.for(gl)` is the one gate for a context. The end of a frame is found by a microtask queued on the first call, so call it from inside the animation frame callback. `cancel(reader)` forgets a readback and its turns (on dispose). Theia's visibility pass and Atlas's feedback pass both read through it. `gate.stats` gives `reads`, `deferred` (frames the GPU had not caught up), `waiting` and `turns`.
 
 ## Development
 

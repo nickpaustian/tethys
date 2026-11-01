@@ -75,4 +75,25 @@ describe("ReadbackGate", () => {
     expect(gate.collected(a)).toBe(false)
     expect(a.reads).toBe(0)
   })
+
+  it("grants one pass a frame, to the reader that has waited longest, and forgets one that stops asking", async () => {
+    const { gl } = fakeContext()
+    const gate = ReadbackGate.for(gl)
+    const a = {}, b = {}, c = {}
+    const turns = new Map<object, number>([[a, 0], [b, 0], [c, 0]])
+    for (let frame = 0; frame < 9; frame++) {
+      let granted = 0
+      for (const reader of [a, b, c]) if (gate.turn(reader)) { granted++; turns.set(reader, turns.get(reader)! + 1) }
+      expect(granted).toBe(1)
+      await endFrame()
+    }
+    expect([...turns.values()]).toEqual([3, 3, 3])
+    // c stops asking: a and b share the turns
+    for (let frame = 0; frame < 4; frame++) {
+      expect(gate.turn(a) || gate.turn(b)).toBe(true)
+      await endFrame()
+    }
+    gate.cancel(a)
+    expect(gate.turn(b)).toBe(true)
+  })
 })
