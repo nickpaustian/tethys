@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { ResidencyPool, type ResidencyOwner } from "../index.js"
+import { CLAIMED, ResidencyPool, type ResidencyOwner } from "../index.js"
 
 // An owner that remembers what each of its slots holds and pins the ones named
 const makeOwner = (pinnedItems: string[] = []) => {
@@ -104,7 +104,7 @@ describe("ResidencyPool", () => {
     expect(b.evicted).toEqual(["b1"])
   })
 
-  it("tells an owner that can yield its slot is claimed, lets it keep the slot for yieldMs, then gives that slot first", () => {
+  it("grants a want a slot it can contest, asks the owner to yield it only when the claimant allocates, and gives that slot first once yieldMs is up", () => {
     const pool = new ResidencyPool({ slots: 2, protectMs: 10_000, yieldMs: 100, budget: false })
     const a = makeOwner()
     const yielded: number[] = []
@@ -115,23 +115,46 @@ describe("ResidencyPool", () => {
     const low = [...a.held].find(([, item]) => item === "a-low")![0]
     pool.post(b.owner, [{ priority: 9 }, { priority: 8 }], 0, 10)
     pool.settle(10)
-    // Claimed, not taken: a is told and keeps it; nothing else is contestable
+    // Granted (a-low is worth less than 9 / 1.5), but nothing is given up yet
     expect(pool.post(b.owner, [], 0, 10)).toEqual([{ priority: 9 }])
+    expect(yielded).toEqual([])
+    // b's page arrives: allocating without claiming takes nothing, claiming asks a to yield
+    expect(pool.allocate(b.owner, 60, 9)).toBe(-1)
+    expect(pool.allocate(b.owner, 60, 9, true)).toBe(CLAIMED)
     expect(yielded).toEqual([low])
     expect(a.evicted).toEqual([])
-    expect(b.place(pool, "b1", 60, 9)).toBe(-1)
     // A yielding slot is not claimed twice
-    pool.post(b.owner, [{ priority: 9 }], 0, 70)
-    pool.settle(70)
+    expect(pool.allocate(b.owner, 70, 9, true)).toBe(-1)
     expect(yielded).toEqual([low])
-    expect(pool.availableSlots(105)).toBe(0)
+    expect(pool.availableSlots(155)).toBe(0)
     // Even unprotected by use, a yielding slot waits out its yieldMs: only a-high counts
     pool.protectMs = 1
-    expect(pool.availableSlots(105)).toBe(1)
+    expect(pool.availableSlots(155)).toBe(1)
     pool.protectMs = 10_000
-    expect(pool.availableSlots(110)).toBe(1)
-    expect(b.place(pool, "b1", 110, 9)).toBe(low)
+    expect(pool.availableSlots(160)).toBe(1)
+    expect(b.place(pool, "b1", 160, 9)).toBe(low)
     expect(a.evicted).toEqual(["a-low"])
+  })
+
+  it("with contestOwn, lets an owner alone in a full pool trade its own least valued slot for a want worth more", () => {
+    const pool = new ResidencyPool({ slots: 2, protectMs: 10_000, budget: false, contestOwn: true })
+    const a = makeOwner(["root"])
+    const yielded: number[] = []
+    a.owner.yield = (slot) => yielded.push(slot)
+    a.place(pool, "root", 0, 100)
+    a.place(pool, "leaf", 0, 2)
+    const leaf = [...a.held].find(([, item]) => item === "leaf")![0]
+    const decide = (priority: number, now: number) => {
+      pool.post(a.owner, [{ priority }], 0, now)
+      pool.settle(now)
+      return pool.post(a.owner, [], 0, now)
+    }
+    expect(decide(2.5, 10)).toEqual([])
+    expect(decide(5, 20)).toEqual([{ priority: 5 }])
+    expect(pool.allocate(a.owner, 30, 5, true)).toBe(CLAIMED)
+    expect(yielded).toEqual([leaf])
+    pool.contestOwn = false
+    expect(decide(500, 40)).toEqual([])
   })
 
   it("does not raise the scale while wants can be met by contesting", () => {
@@ -152,6 +175,38 @@ describe("ResidencyPool", () => {
     // Worth too little to contest a2: stuck, so the scale rises
     frame(1.2, 400)
     expect(pool.scale).toBeCloseTo(1.25)
+  })
+
+  it("sets a cutoff from the posted demand that fits the slots, ignores wants below it, and lowers it only past its band", () => {
+    // Wants at the cutoff itself still count, so wants worth Infinity are never turned away
+    const pool = new ResidencyPool({ slots: 10, cutoffHeadroom: 0.2, cutoffBand: 0.1 })
+    const a = makeOwner()
+    const b = makeOwner()
+    // One frame of both owners posting; the next frame's first post settles it and returns a's grants
+    const frame = (demandA: number[], demandB: number[], wantsA: { priority: number }[], now: number) => {
+      const granted = pool.post(a.owner, wantsA, 0, now, demandA)
+      pool.post(b.owner, [], 0, now, demandB)
+      return granted
+    }
+    // 8 of 10 slots to fill (20% headroom) from 12 demanded values: the cutoff is the 9th largest
+    const wants = [{ priority: 9 }, { priority: 4 }, { priority: 3.5 }]
+    frame([12, 11, 10, 9, 8, 7], [6, 5, 4, 3, 2, 1], wants, 0)
+    const granted = frame([12, 11, 10, 9, 8, 7], [6, 5, 4, 3, 2, 1], wants, 1)
+    expect(pool.cutoff).toBe(4)
+    expect(granted).toEqual([{ priority: 9 }, { priority: 4 }])
+    // Demand eases a little: inside the band, the cutoff holds
+    frame([12, 11, 10, 9, 8, 7], [6, 5, 3.9], [], 2)
+    frame([12, 11, 10, 9, 8, 7], [6, 5, 3.9], [], 3)
+    expect(pool.cutoff).toBe(4)
+    // Well below: it follows
+    frame([12, 11, 10], [6, 5], [], 4)
+    frame([12, 11, 10], [6, 5], [], 5)
+    expect(pool.cutoff).toBe(0)
+    // Off with the budget
+    pool.budget = false
+    frame([12, 11, 10, 9, 8, 7], [6, 5, 4, 3, 2, 1], [], 6)
+    frame([12, 11, 10, 9, 8, 7], [6, 5, 4, 3, 2, 1], [], 7)
+    expect(pool.cutoff).toBe(0)
   })
 
   it("raises the scale while stuck, holds it with the budget off, and eases it once there is room", () => {

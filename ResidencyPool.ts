@@ -1,3 +1,6 @@
+// What allocate returns when it asked a slot's owner to yield it for the caller
+export const CLAIMED = -2
+
 export interface ResidencyOwner {
   // Must this slot keep what it holds whatever else is evicted (a root page, say)?
   pinned(slot: number): boolean
@@ -24,6 +27,10 @@ export interface ResidencyPoolOptions {
   contestMargin?: number
   // Milliseconds a contested slot whose owner can yield stays with it, to fade out what it holds
   yieldMs?: number
+  // Whether an owner's want may contest its own protected slots too, not only other owners'. On,
+  // a full pool always moves toward its most valuable contents, one swap at a time, so an owner
+  // needs no scale to make room. Default off
+  contestOwn?: boolean
   // Whether the budget adjusts `scale`; off, it stays where it is
   budget?: boolean
   // Milliseconds between budget decisions; longer than protectMs, since a change shows only
@@ -31,6 +38,11 @@ export interface ResidencyPoolOptions {
   budgetIntervalMs?: number
   // Free share of the slots below which the scale is not lowered
   budgetHeadroom?: number
+  // Share of the slots the cutoff leaves free, so arrivals and fades have room. Default 0.05
+  cutoffHeadroom?: number
+  // How far the demand's own cutoff must fall below the current one before it is lowered, so a
+  // cut at the edge does not refine and coarsen frame to frame. Default 0.1
+  cutoffBand?: number
   // What the scale is multiplied by when the pool is stuck, and divided by as room returns
   raiseBy?: number
   easeBy?: number
@@ -49,6 +61,7 @@ export interface ResidencyPoolStats {
   slots: number
   freeSlots: number
   scale: number
+  cutoff: number
 }
 
 // One budget of equal slots shared by every owner that keeps things resident: geometry pages,
@@ -63,7 +76,10 @@ export interface ResidencyPoolStats {
 // than `contestMargin` times a protected slot's value may take it. So an owner that arrives to
 // a full pool gets the slots another holds for less than they are worth to it, and the split
 // between owners follows what each one's detail is worth rather than who came first. A slot
-// given no value is never contested. An owner that can `yield` is told its slot is claimed and
+// given no value is never contested. With `contestOwn`, an owner's want may take its own slots
+// the same way, so even one owner alone in a full pool trades what it holds for what is worth
+// more; the most valuable things stay, ancestors before descendants when values follow a
+// hierarchy, and nothing is given up before what replaces it is on its way. An owner that can `yield` is told its slot is claimed and
 // keeps it for `yieldMs`, so it can fade out what the slot holds rather than lose it from one
 // frame to the next; the slot is then the first taken.
 //
@@ -77,19 +93,37 @@ export interface ResidencyPoolStats {
 // posted nothing counts as wanting nothing, so one that stops updating (frozen, off screen)
 // holds no share of what is handed out.
 //
+// Owners that can say what their whole cut would hold (`demand` on post: the value of every
+// thing in use, held back, or wanted) get a `cutoff` instead: the value of the slots-th most
+// valuable thing across every owner's demand. Holding only what is worth more than it fits the
+// budget at once and keeps the most valuable things, with no rising and easing; wants worth
+// less are not granted. Owners whose detail measure cannot be ranked so (a texture's lod bias)
+// use the scale:
+//
 // Once nothing is free and nothing is worth contesting, nothing moves, so the budget works on
 // what is wanted instead: `scale` rises while more is wanted than fits and
 // nothing was placed in the last interval, and falls back toward 1 once wants are met with
 // room to spare. Owners apply it to their own detail measure: a pixel error multiplies by it,
 // a texture lod bias adds log2 of it.
+interface Post {
+  pending: number
+  wanted: ResidencyWant[]
+  demand?: ArrayLike<number>
+}
+
 export default class ResidencyPool {
   public readonly slots: number
   public protectMs: number
   public contestMargin: number
+  public contestOwn: boolean
   public yieldMs: number
   public budget: boolean
   public budgetIntervalMs: number
   public budgetHeadroom: number
+  public cutoffHeadroom: number
+  public cutoffBand: number
+  // The value below which owners that post their demand ask for nothing; 0 while everything fits
+  public cutoff: number = 0
   public raiseBy: number
   public easeBy: number
   public maxScale: number
@@ -107,8 +141,8 @@ export default class ResidencyPool {
   private allocationsAtBudget: number = 0
   private lastBudget: number = -Infinity
   // What each owner posted since the last settle, what the last settle ranked, and its grants
-  private posts: Map<ResidencyOwner, { pending: number; wanted: ResidencyWant[] }> = new Map()
-  private settled: Map<ResidencyOwner, { pending: number; wanted: ResidencyWant[] }> = new Map()
+  private posts: Map<ResidencyOwner, Post> = new Map()
+  private settled: Map<ResidencyOwner, Post> = new Map()
   private readonly grants: Map<ResidencyOwner, ResidencyWant[]> = new Map()
   private readonly members: Set<ResidencyOwner> = new Set()
 
@@ -116,10 +150,13 @@ export default class ResidencyPool {
     slots,
     protectMs = 500,
     contestMargin = 1.5,
+    contestOwn = false,
     yieldMs = 250,
     budget = true,
     budgetIntervalMs = 600,
     budgetHeadroom = 0.1,
+    cutoffHeadroom = 0.05,
+    cutoffBand = 0.1,
     raiseBy = 1.25,
     easeBy = 1.1,
     maxScale = 64,
@@ -128,10 +165,13 @@ export default class ResidencyPool {
     this.slots = Math.floor(slots)
     this.protectMs = protectMs
     this.contestMargin = contestMargin
+    this.contestOwn = contestOwn
     this.yieldMs = yieldMs
     this.budget = budget
     this.budgetIntervalMs = budgetIntervalMs
     this.budgetHeadroom = budgetHeadroom
+    this.cutoffHeadroom = cutoffHeadroom
+    this.cutoffBand = cutoffBand
     this.raiseBy = raiseBy
     this.easeBy = easeBy
     this.maxScale = maxScale
@@ -184,11 +224,13 @@ export default class ResidencyPool {
   }
 
   // A slot for `owner`'s want of this priority: a free one, else one whose owner has yielded
-  // it, else the least recently used that may be taken, else the least valued protected slot of
-  // another owner that cannot yield that the priority contests; its owner is told before this
-  // returns. -1 when none can be had, as when a claimed slot is still yielding. The priority is
-  // the slot's value until its owner touches it with another
-  public allocate(owner: ResidencyOwner, now: number, priority: number = Infinity): number {
+  // it, else the least recently used that may be taken, else the least valued protected slot the
+  // priority contests (another owner's, or with contestOwn any). An owner that can yield is only
+  // asked to, when `claim` is set, and keeps the slot for yieldMs: the call returns CLAIMED, and
+  // the caller holds what it wanted to place and calls again without claiming, until the slot
+  // is free. An owner that cannot yield loses the slot at once. -1 when nothing can be had. The
+  // priority is the slot's value until its owner touches it with another
+  public allocate(owner: ResidencyOwner, now: number, priority: number = Infinity, claim: boolean = false): number {
     this.members.add(owner)
     let slot: number
     if (this.freeSlotCount > 0) {
@@ -204,7 +246,16 @@ export default class ResidencyPool {
           slot = s
         }
       }
-      if (slot === -1 && priority !== Infinity) slot = this.cheapestContestable(owner, priority, now)
+      if (slot === -1 && priority !== Infinity) {
+        slot = this.cheapestContestable(owner, priority, now)
+        const holder = slot >= 0 ? this.owners[slot]! : null
+        if (holder?.yield) {
+          if (!claim) return -1
+          this.yieldingAt[slot] = now
+          holder.yield(slot)
+          return CLAIMED
+        }
+      }
       if (slot === -1) return -1
       this.owners[slot]!.evict(slot)
     }
@@ -216,15 +267,15 @@ export default class ResidencyPool {
     return slot
   }
 
-  // A protected slot of another owner that cannot yield, whose value `priority` beats by the
-  // margin, least valued first
+  // A protected slot not already yielding, another owner's or with contestOwn any, whose value
+  // `priority` beats by the margin, least valued first
   private cheapestContestable(owner: ResidencyOwner, priority: number, now: number): number {
     const minUsed = now - this.protectMs
     let best = -1
     let lowest = priority / this.contestMargin
     for (let s = 0; s < this.slots; s++) {
       const holder = this.owners[s]
-      if (holder === null || holder === owner || holder.yield || this.lastUsed[s] < minUsed || this.values[s] >= lowest || holder.pinned(s)) continue
+      if (holder === null || (holder === owner && !this.contestOwn) || this.yieldingAt[s] >= 0 || this.lastUsed[s] < minUsed || this.values[s] >= lowest || holder.pinned(s)) continue
       lowest = this.values[s]
       best = s
     }
@@ -241,11 +292,12 @@ export default class ResidencyPool {
 
   // Post what `owner` wants this frame and how many it has in flight, replacing its last post;
   // returns its grants from the last settle, which it should act on as far as they are still
-  // wanted. Settles first if the owner already posted since the last settle
-  public post<T extends ResidencyWant>(owner: ResidencyOwner, wanted: T[], pending: number, now: number): T[] {
+  // wanted. Settles first if the owner already posted since the last settle. `demand`, when
+  // given, is the value of everything the owner's cut would hold with no cutoff (see cutoff)
+  public post<T extends ResidencyWant>(owner: ResidencyOwner, wanted: T[], pending: number, now: number, demand?: ArrayLike<number>): T[] {
     this.members.add(owner)
     if (this.posts.has(owner)) this.settle(now)
-    this.posts.set(owner, { pending, wanted })
+    this.posts.set(owner, { pending, wanted, demand })
     const granted = this.grants.get(owner) ?? []
     this.grants.delete(owner)
     return granted as T[]
@@ -259,10 +311,13 @@ export default class ResidencyPool {
     this.posts = new Map()
     this.grants.clear()
     let free = this.availableSlots(now)
+    this.updateCutoff()
     const ranked: Array<{ owner: ResidencyOwner; want: ResidencyWant }> = []
     for (const [owner, post] of this.settled) {
       free -= post.pending
-      for (const want of post.wanted) ranked.push({ owner, want })
+      // An owner that posts its demand holds nothing worth less than the cutoff
+      const floor = post.demand ? this.cutoff : -Infinity
+      for (const want of post.wanted) if (want.priority >= floor) ranked.push({ owner, want })
     }
     ranked.sort((a, b) => b.want.priority - a.want.priority)
     let placeable = 0
@@ -278,20 +333,15 @@ export default class ResidencyPool {
         const limit = want.priority / this.contestMargin
         let at = -1
         for (let i = cheapest; i < contestable.length && contestable[i].value < limit; i++) {
-          if (!contestable[i].taken && contestable[i].owner !== owner) {
+          if (!contestable[i].taken && (this.contestOwn || contestable[i].owner !== owner)) {
             at = i
             break
           }
         }
         if (at === -1) continue
-        const claim = contestable[at]
-        claim.taken = true
-        // An owner that can yield keeps the slot a while to fade out what it holds; one that
-        // cannot loses it when the claimant's page arrives
-        if (claim.owner.yield) {
-          this.yieldingAt[claim.slot] = now
-          claim.owner.yield(claim.slot)
-        }
+        // Only reserved here: the slot is claimed when what was wanted arrives (allocate), so
+        // nothing is given up before its replacement is in hand
+        contestable[at].taken = true
       }
       placeable++
       let list = this.grants.get(owner)
@@ -299,6 +349,33 @@ export default class ResidencyPool {
       list.push(want)
     }
     this.adjustBudget(now, placeable)
+  }
+
+  // The value of the slots-th most valuable thing across every demand posted, less the headroom.
+  // Raised at once, so the cuts fit; lowered once the demand's own falls a band below it
+  private updateCutoff(): void {
+    const demands: ArrayLike<number>[] = []
+    let total = 0
+    for (const post of this.settled.values()) {
+      if (!post.demand) continue
+      demands.push(post.demand)
+      total += post.demand.length
+    }
+    if (!this.budget || demands.length === 0) {
+      this.cutoff = 0
+      return
+    }
+    const room = Math.floor(this.slots * (1 - this.cutoffHeadroom))
+    let target = 0
+    if (total > room) {
+      const values = new Float64Array(total)
+      let at = 0
+      for (const demand of demands) for (let i = 0; i < demand.length; i++) values[at++] = demand[i]
+      values.sort()
+      // Finite, so things worth Infinity (the camera inside their bounds) are never turned away
+      target = Math.min(values[total - room - 1], Number.MAX_VALUE)
+    }
+    if (target > this.cutoff || target < this.cutoff * (1 - this.cutoffBand)) this.cutoff = target
   }
 
   // Protected slots that hold a value, least valued first
@@ -345,6 +422,6 @@ export default class ResidencyPool {
   }
 
   public get stats(): ResidencyPoolStats {
-    return { owners: this.members.size, slots: this.slots, freeSlots: this.freeSlotCount, scale: this.scale }
+    return { owners: this.members.size, slots: this.slots, freeSlots: this.freeSlotCount, scale: this.scale, cutoff: this.cutoff }
   }
 }
