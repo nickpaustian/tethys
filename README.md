@@ -119,6 +119,7 @@ pool.release(owner)                                    // the owner goes: its sl
 | option | default | meaning |
 | --- | --- | --- |
 | `slots` | required | things resident at once across every owner |
+| `capacity` | `slots` | units of storage the things share when they cost different amounts: `allocate(owner, now, priority, claim, cost)` makes room by the unit (least recently used first, then contested slots, as many as the cost needs, giving nothing up unless enough can be), wants carry a `cost`, `pending` is in units, and the cutoff counts each `demand` value at its `demandCosts` entry. Theia's arena counts blocks, a page costing one a cluster |
 | `protectMs` | 500 | milliseconds a used slot is safe from being taken |
 | `contestMargin` | 1.5 | how many times a protected slot's value another owner's want must exceed to take it |
 | `yieldMs` | 250 | milliseconds an owner with a `yield` hook keeps a contested slot before it goes |

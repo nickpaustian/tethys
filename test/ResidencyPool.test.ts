@@ -12,8 +12,8 @@ const makeOwner = (pinnedItems: string[] = []) => {
       held.delete(slot)
     },
   }
-  const place = (pool: ResidencyPool, item: string, now: number, priority?: number) => {
-    const slot = pool.allocate(owner, now, priority)
+  const place = (pool: ResidencyPool, item: string, now: number, priority?: number, cost?: number) => {
+    const slot = pool.allocate(owner, now, priority, false, cost)
     if (slot >= 0) held.set(slot, item)
     return slot
   }
@@ -258,5 +258,52 @@ describe("ResidencyPool", () => {
     pool.release(a.owner)
     expect(pool.stats).toMatchObject({ owners: 1, freeSlots: 3 })
     expect(a.evicted).toEqual([])
+  })
+
+  it("makes room by the unit for things of different costs, least recently used first, and frees nothing when it cannot make enough", () => {
+    const pool = new ResidencyPool({ slots: 8, capacity: 10, protectMs: 100, budget: false })
+    const a = makeOwner()
+    const b = makeOwner()
+    a.place(pool, "a1", 0, 1, 3)
+    a.place(pool, "a2", 10, 1, 3)
+    a.place(pool, "a3", 20, 1, 3)
+    expect(pool.stats).toMatchObject({ capacity: 10, freeCapacity: 1 })
+    // 4 units with 1 free: the oldest (3) is enough
+    expect(b.place(pool, "b1", 500, 1, 4)).toBeGreaterThanOrEqual(0)
+    expect(a.evicted).toEqual(["a1"])
+    expect(pool.stats.freeCapacity).toBe(0)
+    // 7 units: the two left (6) and nothing free are not enough, so nothing goes
+    expect(b.place(pool, "b2", 600, 1, 7)).toBe(-1)
+    expect(a.evicted).toEqual(["a1"])
+    // 6 units: both
+    expect(b.place(pool, "b2", 700, 1, 6)).toBeGreaterThanOrEqual(0)
+    expect(a.evicted).toEqual(["a1", "a2", "a3"])
+  })
+
+  it("claims as many contested slots as a cost needs, cheapest first, and grants by the unit at a settle", () => {
+    const pool = new ResidencyPool({ slots: 8, capacity: 10, protectMs: 10_000, budget: false })
+    const a = makeOwner()
+    const yielded: number[] = []
+    a.owner.yield = (slot) => yielded.push(slot)
+    const b = makeOwner()
+    a.place(pool, "cheap", 0, 1, 2)
+    a.place(pool, "mid", 0, 2, 2)
+    a.place(pool, "dear", 0, 50, 5)
+    // 1 free; a want worth 9 costing 4 needs both cheap slots (values 1 and 2, under 9 / 1.5)
+    pool.post(b.owner, [{ priority: 9, cost: 4 }, { priority: 9, cost: 9 }], 0, 0)
+    pool.settle(0)
+    expect(pool.post(b.owner, [], 0, 0)).toEqual([{ priority: 9, cost: 4 }])
+    expect(pool.allocate(b.owner, 10, 9, true, 4)).toBe(CLAIMED)
+    expect(yielded).toHaveLength(2)
+    expect(a.evicted).toEqual([])
+  })
+
+  it("sets the cutoff where the most valuable demand fills the capacity, by cost", () => {
+    const pool = new ResidencyPool({ slots: 20, capacity: 10, cutoffHeadroom: 0 })
+    const a = makeOwner()
+    // Worth 9, 8, 7, 6 at costs 3, 3, 3, 3: three fit in 10, the fourth does not
+    pool.post(a.owner, [], 0, 0, [9, 8, 7, 6], [3, 3, 3, 3])
+    pool.post(a.owner, [], 0, 1, [9, 8, 7, 6], [3, 3, 3, 3])
+    expect(pool.cutoff).toBe(6)
   })
 })

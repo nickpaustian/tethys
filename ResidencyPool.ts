@@ -16,11 +16,17 @@ export interface ResidencyWant {
   // In a measure every owner shares (projected error in pixels, screen coverage), so wants
   // rank across owners
   priority: number
+  // Units of capacity it would take (see the capacity option); 1 when not given
+  cost?: number
 }
 
 export interface ResidencyPoolOptions {
   // Things resident at once, across every owner
   slots: number
+  // Units of storage the things share, when they cost different amounts (a page of geometry
+  // takes a block per cluster): each allocation names its cost, and room is made by the unit.
+  // Default `slots`, every thing costing 1
+  capacity?: number
   // Milliseconds a used slot is safe from being taken
   protectMs?: number
   // How many times a slot's value another owner's want must exceed to take it while it is
@@ -61,6 +67,8 @@ export interface ResidencyPoolStats {
   owners: number
   slots: number
   freeSlots: number
+  capacity: number
+  freeCapacity: number
   scale: number
   cutoff: number
 }
@@ -110,10 +118,12 @@ interface Post {
   pending: number
   wanted: ResidencyWant[]
   demand?: ArrayLike<number>
+  demandCosts?: ArrayLike<number>
 }
 
 export default class ResidencyPool {
   public readonly slots: number
+  public readonly capacity: number
   public protectMs: number
   public contestMargin: number
   public contestOwn: boolean
@@ -133,6 +143,9 @@ export default class ResidencyPool {
   private readonly owners: (ResidencyOwner | null)[]
   private readonly lastUsed: Float64Array
   private readonly values: Float64Array
+  // What each slot's contents cost, in units of capacity; 0 when free
+  private readonly costs: Float64Array
+  private usedCost: number = 0
   // When each slot was claimed from an owner that yields; -1 when it was not
   private readonly yieldingAt: Float64Array
   // The free slots as a stack, so taking or freeing one is O(1)
@@ -149,6 +162,7 @@ export default class ResidencyPool {
 
   constructor({
     slots,
+    capacity,
     protectMs = 500,
     contestMargin = 1.5,
     contestOwn = false,
@@ -164,6 +178,7 @@ export default class ResidencyPool {
   }: ResidencyPoolOptions) {
     if (!(slots >= 1)) throw new Error(`ResidencyPool: needs at least one slot, got ${slots}`)
     this.slots = Math.floor(slots)
+    this.capacity = capacity ?? this.slots
     this.protectMs = protectMs
     this.contestMargin = contestMargin
     this.contestOwn = contestOwn
@@ -179,6 +194,7 @@ export default class ResidencyPool {
     this.owners = new Array(this.slots).fill(null)
     this.lastUsed = new Float64Array(this.slots)
     this.values = new Float64Array(this.slots).fill(Infinity)
+    this.costs = new Float64Array(this.slots)
     this.yieldingAt = new Float64Array(this.slots).fill(-1)
     this.freeSlots = new Int32Array(this.slots)
     for (let i = 0; i < this.slots; i++) this.freeSlots[i] = this.slots - 1 - i
@@ -222,72 +238,99 @@ export default class ResidencyPool {
     return this.yieldingAt[slot] >= 0 ? this.yielded(slot, now) : this.lastUsed[slot] < now - this.protectMs
   }
 
-  // Slots something new could take now: free ones, those neither protected nor pinned, and
-  // those whose owner has had its time to yield
+  // Room something new could take now, in units of capacity: what is free, and what slots
+  // neither protected nor pinned, or whose owner has had its time to yield, hold
   public availableSlots(now: number): number {
-    let count = this.freeSlotCount
-    for (let slot = 0; slot < this.slots; slot++) if (this.evictable(slot, now)) count++
-    return count
+    let units = this.capacity - this.usedCost
+    for (let slot = 0; slot < this.slots; slot++) if (this.evictable(slot, now)) units += this.costs[slot]
+    return units
   }
 
-  // A slot for `owner`'s want of this priority: a free one, else one whose owner has yielded
-  // it, else the least recently used that may be taken, else the least valued protected slot the
-  // priority contests (another owner's, or with contestOwn any). An owner that can yield is only
-  // asked to, when `claim` is set, and keeps the slot for yieldMs: the call returns CLAIMED, and
-  // the caller holds what it wanted to place and calls again without claiming, until the slot
-  // is free. An owner that cannot yield loses the slot at once. -1 when nothing can be had. The
-  // priority is the slot's value until its owner touches it with another
-  public allocate(owner: ResidencyOwner, now: number, priority: number = Infinity, claim: boolean = false): number {
+  // Capacity not held by anything
+  public get freeCapacity(): number {
+    return this.capacity - this.usedCost
+  }
+
+  // A slot for `owner`'s want of this priority, costing `cost` units of capacity. Room is made
+  // from what is free, then from slots whose owner has yielded them, then the least recently
+  // used that may be taken, then the least valued protected slots the priority contests
+  // (another owner's, or with contestOwn any), as many as the cost needs; nothing is given up
+  // unless enough can be. An owner that can yield is only asked to, when `claim` is set, and
+  // keeps its slot for yieldMs: the call returns CLAIMED, and the caller holds what it wanted to
+  // place and calls again without claiming, until there is room. An owner that cannot yield, or
+  // shows nothing of the slot, loses it at once. -1 when there is no room to be had. The priority
+  // is the slot's value until its owner touches it with another
+  public allocate(owner: ResidencyOwner, now: number, priority: number = Infinity, claim: boolean = false, cost: number = 1): number {
     this.members.add(owner)
-    let slot: number
-    if (this.freeSlotCount > 0) {
-      slot = this.freeSlots[--this.freeSlotCount]
-    } else {
-      slot = -1
-      let oldest = Infinity
-      for (let s = 0; s < this.slots; s++) {
-        if (!this.evictable(s, now)) continue
-        const used = this.yielded(s, now) ? -Infinity : this.lastUsed[s]
-        if (used < oldest) {
-          oldest = used
-          slot = s
+    let free = this.capacity - this.usedCost
+    let entries = this.freeSlotCount
+    const enough = () => free >= cost && entries > 0
+    if (!enough()) {
+      // Least recently used first, yielded before everything
+      const plan: number[] = []
+      const lru: number[] = []
+      for (let s = 0; s < this.slots; s++) if (this.evictable(s, now)) lru.push(s)
+      lru.sort((a, b) => (this.yielded(a, now) ? -Infinity : this.lastUsed[a]) - (this.yielded(b, now) ? -Infinity : this.lastUsed[b]))
+      for (const s of lru) {
+        if (enough()) break
+        plan.push(s)
+        free += this.costs[s]
+        entries++
+      }
+      const claims: number[] = []
+      if (!enough() && priority !== Infinity) {
+        for (const s of this.contestableFor(owner, priority, now)) {
+          if (enough()) break
+          claims.push(s)
+          free += this.costs[s]
+          entries++
         }
       }
-      if (slot === -1 && priority !== Infinity) {
-        slot = this.cheapestContestable(owner, priority, now)
-        const holder = slot >= 0 ? this.owners[slot]! : null
-        if (holder?.yield) {
-          if (!claim) return -1
-          this.yieldingAt[slot] = now
+      if (!enough()) return -1
+      const asking = claims.filter((s) => this.owners[s]!.yield)
+      if (asking.length > 0) {
+        if (!claim) return -1
+        let waiting = false
+        for (const s of asking) {
+          this.yieldingAt[s] = now
           // An owner showing nothing of the slot says so, and it goes at once
-          if (holder.yield(slot) !== false) return CLAIMED
-          this.yieldingAt[slot] = -1
+          if (this.owners[s]!.yield!(s) !== false) waiting = true
+          else this.take(s)
         }
+        if (waiting) return CLAIMED
       }
-      if (slot === -1) return -1
-      this.owners[slot]!.evict(slot)
+      for (const s of plan) this.take(s)
+      for (const s of claims) if (this.owners[s]) this.take(s)
     }
+    const slot = this.freeSlots[--this.freeSlotCount]
     this.owners[slot] = owner
     this.lastUsed[slot] = now
     this.values[slot] = priority
     this.yieldingAt[slot] = -1
+    this.costs[slot] = cost
+    this.usedCost += cost
     this.allocations++
     return slot
   }
 
-  // A protected slot not already yielding, another owner's or with contestOwn any, whose value
+  // Take a slot from its owner, who is told, and free it
+  private take(slot: number): void {
+    this.owners[slot]!.evict(slot)
+    this.free(slot)
+  }
+
+  // Protected slots not already yielding, another owner's or with contestOwn any, whose value
   // `priority` beats by the margin, least valued first
-  private cheapestContestable(owner: ResidencyOwner, priority: number, now: number): number {
+  private contestableFor(owner: ResidencyOwner, priority: number, now: number): number[] {
     const minUsed = now - this.protectMs
-    let best = -1
-    let lowest = priority / this.contestMargin
+    const limit = priority / this.contestMargin
+    const found: number[] = []
     for (let s = 0; s < this.slots; s++) {
       const holder = this.owners[s]
-      if (holder === null || (holder === owner && !this.contestOwn) || this.yieldingAt[s] >= 0 || this.lastUsed[s] < minUsed || this.values[s] >= lowest || holder.pinned(s)) continue
-      lowest = this.values[s]
-      best = s
+      if (holder === null || (holder === owner && !this.contestOwn) || this.yieldingAt[s] >= 0 || this.lastUsed[s] < minUsed || this.values[s] >= limit || holder.pinned(s)) continue
+      found.push(s)
     }
-    return best
+    return found.sort((a, b) => this.values[a] - this.values[b])
   }
 
   // Give back a slot its owner no longer needs
@@ -295,17 +338,20 @@ export default class ResidencyPool {
     if (!this.owners[slot]) return
     this.owners[slot] = null
     this.yieldingAt[slot] = -1
+    this.usedCost -= this.costs[slot]
+    this.costs[slot] = 0
     this.freeSlots[this.freeSlotCount++] = slot
   }
 
   // Post what `owner` wants this frame and how many it has in flight, replacing its last post;
   // returns its grants from the last settle, which it should act on as far as they are still
   // wanted. Settles first if the owner already posted since the last settle. `demand`, when
-  // given, is the value of everything the owner's cut would hold with no cutoff (see cutoff)
-  public post<T extends ResidencyWant>(owner: ResidencyOwner, wanted: T[], pending: number, now: number, demand?: ArrayLike<number>): T[] {
+  // given, is the value of everything the owner's cut would hold with no cutoff (see cutoff),
+  // and `demandCosts` what each costs (1 each when not given). `pending` is in units of capacity
+  public post<T extends ResidencyWant>(owner: ResidencyOwner, wanted: T[], pending: number, now: number, demand?: ArrayLike<number>, demandCosts?: ArrayLike<number>): T[] {
     this.members.add(owner)
     if (this.posts.has(owner)) this.settle(now)
-    this.posts.set(owner, { pending, wanted, demand })
+    this.posts.set(owner, { pending, wanted, demand, demandCosts })
     const granted = this.grants.get(owner) ?? []
     this.grants.delete(owner)
     return granted as T[]
@@ -329,27 +375,31 @@ export default class ResidencyPool {
     }
     ranked.sort((a, b) => b.want.priority - a.want.priority)
     let placeable = 0
-    let contestable: Array<{ slot: number; owner: ResidencyOwner; value: number; taken: boolean }> | null = null
+    let contestable: Array<{ slot: number; owner: ResidencyOwner; value: number; cost: number; taken: boolean }> | null = null
     let cheapest = 0
     for (const { owner, want } of ranked) {
-      if (free > 0) {
-        free--
+      const cost = want.cost ?? 1
+      if (free >= cost) {
+        free -= cost
       } else {
         contestable ??= this.contestable(now)
-        // The claim is the cheapest untaken slot of another owner below the want's limit
+        // The claims are the cheapest untaken slots of another owner below the want's limit,
+        // as many as the cost needs beyond what is free
         while (cheapest < contestable.length && contestable[cheapest].taken) cheapest++
         const limit = want.priority / this.contestMargin
-        let at = -1
-        for (let i = cheapest; i < contestable.length && contestable[i].value < limit; i++) {
+        let covered = Math.max(0, free)
+        const picked: number[] = []
+        for (let i = cheapest; i < contestable.length && contestable[i].value < limit && covered < cost; i++) {
           if (!contestable[i].taken && (this.contestOwn || contestable[i].owner !== owner)) {
-            at = i
-            break
+            picked.push(i)
+            covered += contestable[i].cost
           }
         }
-        if (at === -1) continue
-        // Only reserved here: the slot is claimed when what was wanted arrives (allocate), so
+        if (covered < cost) continue
+        // Only reserved here: the slots are claimed when what was wanted arrives (allocate), so
         // nothing is given up before its replacement is in hand
-        contestable[at].taken = true
+        for (const i of picked) contestable[i].taken = true
+        free = Math.min(0, free)
       }
       placeable++
       let list = this.grants.get(owner)
@@ -359,41 +409,57 @@ export default class ResidencyPool {
     this.adjustBudget(now, placeable)
   }
 
-  // The value of the slots-th most valuable thing across every demand posted, less the headroom.
-  // Raised at once, so the cuts fit; lowered once the demand's own falls a band below it
+  // The value at which the most valuable things across every demand posted fill the capacity,
+  // less the headroom. Raised at once, so the cuts fit; lowered once the demand's own falls a
+  // band below it
   private updateCutoff(): void {
-    const demands: ArrayLike<number>[] = []
-    let total = 0
+    const posts: Post[] = []
+    let count = 0
     for (const post of this.settled.values()) {
       if (!post.demand) continue
-      demands.push(post.demand)
-      total += post.demand.length
+      posts.push(post)
+      count += post.demand.length
     }
-    if (!this.budget || demands.length === 0) {
+    if (!this.budget || posts.length === 0) {
       this.cutoff = 0
       return
     }
-    const room = Math.floor(this.slots * (1 - this.cutoffHeadroom))
+    const room = this.capacity * (1 - this.cutoffHeadroom)
+    const values = new Float64Array(count)
+    const costs = new Float64Array(count)
+    let at = 0
+    let total = 0
+    for (const post of posts) {
+      for (let i = 0; i < post.demand!.length; i++) {
+        values[at] = post.demand![i]
+        costs[at] = post.demandCosts?.[i] ?? 1
+        total += costs[at++]
+      }
+    }
     let target = 0
     if (total > room) {
-      const values = new Float64Array(total)
-      let at = 0
-      for (const demand of demands) for (let i = 0; i < demand.length; i++) values[at++] = demand[i]
-      values.sort()
-      // Finite, so things worth Infinity (the camera inside their bounds) are never turned away
-      target = Math.min(values[total - room - 1], Number.MAX_VALUE)
+      const order = Array.from({ length: count }, (_, i) => i).sort((a, b) => values[b] - values[a])
+      let held = 0
+      for (const i of order) {
+        held += costs[i]
+        if (held > room) {
+          // Finite, so things worth Infinity (the camera inside their bounds) are never turned away
+          target = Math.min(values[i], Number.MAX_VALUE)
+          break
+        }
+      }
     }
     if (target > this.cutoff || target < this.cutoff * (1 - this.cutoffBand)) this.cutoff = target
   }
 
   // Protected slots that hold a value, least valued first
-  private contestable(now: number): Array<{ slot: number; owner: ResidencyOwner; value: number; taken: boolean }> {
+  private contestable(now: number): Array<{ slot: number; owner: ResidencyOwner; value: number; cost: number; taken: boolean }> {
     const minUsed = now - this.protectMs
-    const slots: Array<{ slot: number; owner: ResidencyOwner; value: number; taken: boolean }> = []
+    const slots: Array<{ slot: number; owner: ResidencyOwner; value: number; cost: number; taken: boolean }> = []
     for (let s = 0; s < this.slots; s++) {
       const holder = this.owners[s]
       if (holder === null || this.lastUsed[s] < minUsed || this.yieldingAt[s] >= 0 || this.values[s] === Infinity || holder.pinned(s)) continue
-      slots.push({ slot: s, owner: holder, value: this.values[s], taken: false })
+      slots.push({ slot: s, owner: holder, value: this.values[s], cost: this.costs[s], taken: false })
     }
     return slots.sort((a, b) => a.value - b.value)
   }
@@ -410,7 +476,7 @@ export default class ResidencyPool {
     this.allocationsAtBudget = this.allocations
     this.lastBudget = now
     if (wanted > placeable && placed === 0) this.scale = Math.min(this.maxScale, this.scale * this.raiseBy)
-    else if (wanted === 0 && pending === 0 && this.scale > 1 && this.availableSlots(now) > this.slots * this.budgetHeadroom) this.scale = Math.max(1, this.scale / this.easeBy)
+    else if (wanted === 0 && pending === 0 && this.scale > 1 && this.availableSlots(now) > this.capacity * this.budgetHeadroom) this.scale = Math.max(1, this.scale / this.easeBy)
   }
 
   // Forget an owner: its slots are free and its posts and grants withdrawn. It is not told
@@ -430,6 +496,6 @@ export default class ResidencyPool {
   }
 
   public get stats(): ResidencyPoolStats {
-    return { owners: this.members.size, slots: this.slots, freeSlots: this.freeSlotCount, scale: this.scale, cutoff: this.cutoff }
+    return { owners: this.members.size, slots: this.slots, freeSlots: this.freeSlotCount, capacity: this.capacity, freeCapacity: this.capacity - this.usedCost, scale: this.scale, cutoff: this.cutoff }
   }
 }
