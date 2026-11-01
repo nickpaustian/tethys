@@ -167,9 +167,12 @@ export default class ResidencyPool {
     return this.yieldingAt[slot] >= 0 && now - this.yieldingAt[slot] >= this.yieldMs
   }
 
+  // A yielding slot goes only once its owner has had yieldMs to fade it out, however long since
+  // it was used: the owner stops using what it holds as soon as it is told
   private evictable(slot: number, now: number): boolean {
     const owner = this.owners[slot]
-    return owner !== null && (this.lastUsed[slot] < now - this.protectMs || this.yielded(slot, now)) && !owner.pinned(slot)
+    if (owner === null || owner.pinned(slot)) return false
+    return this.yieldingAt[slot] >= 0 ? this.yielded(slot, now) : this.lastUsed[slot] < now - this.protectMs
   }
 
   // Slots something new could take now: free ones, those neither protected nor pinned, and

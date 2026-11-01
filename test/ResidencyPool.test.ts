@@ -125,6 +125,10 @@ describe("ResidencyPool", () => {
     pool.settle(70)
     expect(yielded).toEqual([low])
     expect(pool.availableSlots(105)).toBe(0)
+    // Even unprotected by use, a yielding slot waits out its yieldMs: only a-high counts
+    pool.protectMs = 1
+    expect(pool.availableSlots(105)).toBe(1)
+    pool.protectMs = 10_000
     expect(pool.availableSlots(110)).toBe(1)
     expect(b.place(pool, "b1", 110, 9)).toBe(low)
     expect(a.evicted).toEqual(["a-low"])
