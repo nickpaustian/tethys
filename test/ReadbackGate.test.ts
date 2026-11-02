@@ -63,6 +63,26 @@ describe("ReadbackGate", () => {
     expect(gate.stats).toMatchObject({ reads: 3, waiting: 0 })
   })
 
+  it("reads anyway after four frames waiting on a GPU that stays a frame behind", async () => {
+    const { gl } = fakeContext()
+    const gate = ReadbackGate.for(gl)
+    const a = reader()
+    a.ready = true
+    gate.submit(a, a.readback)
+    await endFrame()
+    // The frame before never finishes in time: four frames wait, the fifth reads
+    for (let frame = 0; frame < 4; frame++) {
+      expect(gate.collected(a)).toBe(false)
+      await endFrame()
+    }
+    expect(gate.collected(a)).toBe(true)
+    expect(gate.stats).toMatchObject({ reads: 1, deferred: 4, forced: 1 })
+    // The count starts again after a read
+    gate.submit(a, a.readback)
+    await endFrame()
+    expect(gate.collected(a)).toBe(false)
+  })
+
   it("forgets a cancelled readback", async () => {
     const { gl, catchUp } = fakeContext()
     const gate = ReadbackGate.for(gl)

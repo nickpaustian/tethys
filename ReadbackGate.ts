@@ -7,7 +7,10 @@
 // each frame. Readers submit their fenced readbacks; the first time any reader asks in a frame,
 // before that frame has uploaded anything, every submitted readback whose own fence has
 // signalled is read, back to back, provided the last frame's fence has signalled too. Reads in
-// a row with nothing queued between them cost a fraction of a millisecond.
+// a row with nothing queued between them cost a fraction of a millisecond. A GPU that stays a
+// frame behind (a heavy scene) never lets the frame before finish in time, so after
+// MAX_DEFERRED_FRAMES frames waiting the gate reads anyway: one short stall every few frames,
+// where waiting for the GPU to catch up would starve every reader for as long as the scene is heavy.
 //
 // The passes behind the readbacks (low-resolution redraws of the scene) are optional work the
 // GPU does on top of the frame, so they take turns too: `turn` grants one a frame, to whichever
@@ -22,6 +25,9 @@ export interface Readback {
   // Reads the data back (binds its buffer and calls getBufferSubData)
   read(): void
 }
+
+// Frames in a row the gate waits for the GPU to catch up before reading regardless
+const MAX_DEFERRED_FRAMES = 4
 
 export default class ReadbackGate {
   private static gates = new WeakMap<WebGL2RenderingContext, ReadbackGate>()
@@ -41,6 +47,8 @@ export default class ReadbackGate {
   private done = new Set<object>()
   private reads = 0
   private deferred = 0
+  private deferredInARow = 0
+  private forced = 0
   private frame = 0
   private turnTaken = false
   // Each reader's last turn and last ask, by frame; one that stops asking drops out after a frame
@@ -52,8 +60,8 @@ export default class ReadbackGate {
     this.gl = gl
   }
 
-  public get stats(): { reads: number; deferred: number; waiting: number; turns: number } {
-    return { reads: this.reads, deferred: this.deferred, waiting: this.submitted.size, turns: this.turns }
+  public get stats(): { reads: number; deferred: number; forced: number; waiting: number; turns: number } {
+    return { reads: this.reads, deferred: this.deferred, forced: this.forced, waiting: this.submitted.size, turns: this.turns }
   }
 
   // Whether `reader` may render its pass this frame: one a frame, to the reader asking that has
@@ -105,9 +113,14 @@ export default class ReadbackGate {
     if (this.submitted.size === 0) return
     const gl = this.gl
     if (this.frameFence && gl.getSyncParameter(this.frameFence, gl.SYNC_STATUS) !== gl.SIGNALED) {
-      this.deferred++
-      return
+      if (this.deferredInARow < MAX_DEFERRED_FRAMES) {
+        this.deferred++
+        this.deferredInARow++
+        return
+      }
+      this.forced++
     }
+    this.deferredInARow = 0
     for (const [reader, readback] of this.submitted) {
       if (!readback.ready()) continue
       readback.read()
